@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+
+# checkpoints, token shards, run output
+*.pt
+*.bin
+*.tmp
+run/
+runs/
+scratch/
+data/
+tokens/
+output/
+loss.csv
+status.json
+
+# kaggle api credentials and generated metadata
+kaggle.json
+kernel-metadata.json
+dataset-metadata.json
