@@ -453,6 +453,7 @@ bug and want to do that, the resume machinery is all there:
 | `no meta.json in /kaggle/working/tokens` | cell 1 did not finish. Check its output for a download error |
 | `ModuleNotFoundError: tiktoken` | Internet was Off when it ran |
 | `fatal: could not read from remote repository` | Internet was Off, or the repo is private |
+| `PyGILState_Release` / `Aborted (core dumped)` after tokenizing finished | harmless, and handled since Jul 2026. The shards were already written; HuggingFace's streaming reader just crashed on the way out. Re-run the cell, tokenizing will no-op and training will start |
 | `No such file or directory: '/kaggle/working/code'` | the session restarted and wiped `/kaggle/working`. Re-run the one cell, and commit the real run instead of running interactively |
 | `found 1 gpu(s), not 2` | Accelerator is not set to **GPU T4 x2**. It will still train, just at half speed |
 | no `gradio.live` link printed | you forgot `share=True`, or Internet is Off |

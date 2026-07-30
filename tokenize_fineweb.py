@@ -20,6 +20,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -105,6 +106,8 @@ def main() -> None:
     p.add_argument("--shard-tokens", type=float, default=5e8, help="1 GB per 5e8 tokens")
     p.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 1))
     p.add_argument("--batch", type=int, default=256, help="documents per worker chunk")
+    p.add_argument("--verify-only", action="store_true",
+                   help="exit 0 if the shards already cover --max-tokens, non-zero otherwise")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -119,11 +122,21 @@ def main() -> None:
         existing_train = old["shards"]["train"]
         existing_val = old["shards"]["val"]
         done_tokens = old.get("total_tokens", 0)
+
+    complete = done_tokens >= max_tokens
+    if args.verify_only:
+        if complete:
+            print(f"shards complete: {done_tokens / 1e9:.3f}B tokens in {out_dir}")
+            return
+        raise SystemExit(f"shards incomplete: only {done_tokens / 1e9:.3f}B of "
+                         f"{max_tokens / 1e9:.3f}B tokens in {out_dir}")
+
+    if meta_path.exists():
         print(f"resuming: {done_tokens / 1e9:.3f}B tokens already written, "
               f"skipping {skip_docs:,} documents")
         # Check before importing datasets, so a re-run with complete shards
         # needs neither the package nor the network.
-        if done_tokens >= max_tokens:
+        if complete:
             print("already at the requested token count, nothing to do")
             return
 
@@ -190,3 +203,12 @@ def main() -> None:
 if __name__ == "__main__":
     mp.freeze_support()
     main()
+    # The HuggingFace streaming reader leaves background HTTP threads running.
+    # Once main() returns they have nothing left to do, but if one is mid-request
+    # when the interpreter starts finalizing it touches a dead GIL and the process
+    # aborts with "PyGILState_Release: auto-releasing thread-state" and a core
+    # dump, long after the shards are safely on disk. A non-zero exit there would
+    # take the whole run script down with it, so skip finalization entirely.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)

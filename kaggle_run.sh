@@ -31,7 +31,13 @@ if [ "${SMOKE:-0}" = "1" ]; then
   echo "SMOKE=1: skipping tokenization, training a tiny model on generated data"
 else
   # Resumable: if meta.json already has enough tokens this returns immediately.
-  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS"
+  # A non-zero exit here is not conclusive. The HF streaming reader can abort
+  # during interpreter shutdown, after the shards are already written, so ask
+  # separately whether the data is actually complete rather than trusting the
+  # exit code.
+  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS" \
+    || echo "tokenizer exited non-zero, checking the shards themselves"
+  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS" --verify-only
 fi
 
 # Reserve time for tokenizing, and derive the schedule knobs from the budget:
