@@ -101,8 +101,8 @@ class RunDir:
             return []
 
 
-_CKPT_RE = re.compile(r"(ckpt|weights|milestone)_step(\d+)\.pt$")
-_KINDS = {"ckpt": "full", "weights": "weights", "milestone": "milestone"}
+_CKPT_RE = re.compile(r"(ckpt|weights|milestone|sft)_step(\d+)\.pt$")
+_KINDS = {"ckpt": "full", "weights": "weights", "milestone": "milestone", "sft": "sft"}
 
 
 def find_checkpoints(search_dirs) -> list[dict]:
@@ -110,7 +110,8 @@ def find_checkpoints(search_dirs) -> list[dict]:
 
     kind 'full' has optimizer state and can be resumed from. 'weights' is the
     small rolling fp16 copy, 'milestone' is the same thing but never pruned, so
-    it is what you use to compare early against late on the same prompt.
+    it is what you use to compare early against late on the same prompt. 'sft'
+    is an instruction-tuned model, which the chat tab formats differently.
     """
     found: dict[Path, dict] = {}
     patterns = ["*.pt", "*/*.pt", "*/*/*.pt", "*/*/*/*.pt"]

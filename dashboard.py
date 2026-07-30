@@ -59,6 +59,13 @@ def get_tokenizer():
     return tiktoken.get_encoding("gpt2")
 
 
+def _show(enc, token: int) -> str:
+    """Printable form of a token id, including the turn tokens above the BPE range."""
+    if token >= enc.n_vocab:
+        return {50257: "<|user|>", 50258: "<|assistant|>"}.get(token, f"<|{token}|>")
+    return repr(enc.decode([token]))
+
+
 def checkpoint_choices(run_dir: Path) -> list[str]:
     cands = find_checkpoints([run_dir, *default_search_dirs()])
     return [f"step {c['step']:,} [{c['kind']}, {c['size_mb']:.0f} MB]  {c['path']}"
@@ -66,37 +73,60 @@ def checkpoint_choices(run_dir: Path) -> list[str]:
 
 
 def _path_from_choice(choice: str) -> Path:
-    return Path(choice.split("]", 1)[1].strip())
+    """Accepts a dropdown label or a bare path typed into the override box."""
+    choice = (choice or "").strip().strip('"')
+    return Path(choice.split("]", 1)[1].strip() if "]" in choice else choice)
 
 
-def load_checkpoint(choice: str):
-    if not choice:
-        return "pick a checkpoint first"
-    path = _path_from_choice(choice)
+def load_checkpoint(choice: str, override_path: str = ""):
+    target = override_path.strip() or choice
+    if not target:
+        return "pick a checkpoint from the list, or type a path"
+    path = _path_from_choice(target)
+    if not path.exists():
+        return f"no such file: {path}"
     key = str(path)
     if key not in _model_cache:
         model, ckpt = load_model_from_checkpoint(path, device="cpu")
         _model_cache.clear()  # one model at a time keeps RAM sane
-        _model_cache[key] = (model, ckpt.get("step"), ckpt.get("data_fingerprint", "?"))
-    model, step, fp = _model_cache[key]
-    n = sum(p.numel() for p in model.parameters())
-    return (f"loaded step {step:,} from {path.name}\n"
-            f"{n / 1e6:.1f}M params, block_size {model.cfg.block_size}, tokenizer fingerprint {fp}")
+        _model_cache[key] = {
+            "model": model,
+            "step": ckpt.get("step"),
+            "fingerprint": ckpt.get("data_fingerprint", "?"),
+            "sft": bool(ckpt.get("sft")),
+            "user_token": ckpt.get("user_token"),
+            "assistant_token": ckpt.get("assistant_token"),
+        }
+    e = _model_cache[key]
+    n = sum(p.numel() for p in e["model"].parameters())
+    kind = ("instruction-tuned, the chat tab will use its turn tokens"
+            if e["sft"] else "base model, it continues text rather than answering")
+    return (f"loaded step {e['step']:,} from {path.name}\n"
+            f"{n / 1e6:.1f}M params, block_size {e['model'].cfg.block_size}\n"
+            f"{kind}")
+
+
+def _active():
+    return next(iter(_model_cache.values())) if _model_cache else None
 
 
 @torch.no_grad()
 def generate_stream(choice: str, prompt: str, max_tokens: int, temperature: float,
-                    top_k: int, greedy: bool):
+                    top_k: int, greedy: bool, prefix_ids: list[int] | None = None,
+                    stats: bool = True):
     global _last_probs
     if not _model_cache:
         msg = load_checkpoint(choice)
         if not _model_cache:
             yield msg, []
             return
-    model = next(iter(_model_cache.values()))[0]
+    model = _active()["model"]
     enc = get_tokenizer()
 
-    ids = enc.encode_ordinary(prompt) if prompt else [enc.eot_token]
+    if prefix_ids is not None:
+        ids = list(prefix_ids)
+    else:
+        ids = enc.encode_ordinary(prompt) if prompt else [enc.eot_token]
     ids = ids[-(model.cfg.block_size - 1) :]
     idx = torch.tensor([ids], dtype=torch.long)
 
@@ -111,8 +141,7 @@ def generate_stream(choice: str, prompt: str, max_tokens: int, temperature: floa
         entropy = float(-(probs_full * probs_full.clamp_min(1e-12).log()).sum())
 
         top_p, top_i = probs_full.topk(5)
-        top5 = ", ".join(f"{enc.decode([int(t)])!r}={float(p):.3f}"
-                         for p, t in zip(top_p, top_i))
+        top5 = ", ".join(f"{_show(enc, int(t))}={float(p):.3f}" for p, t in zip(top_p, top_i))
 
         if greedy:
             nxt = int(logits.argmax())
@@ -123,38 +152,73 @@ def generate_stream(choice: str, prompt: str, max_tokens: int, temperature: floa
                 scaled = scaled.masked_fill(scaled < kth, float("-inf"))
             nxt = int(torch.multinomial(F.softmax(scaled, dim=-1), 1))
 
-        piece = enc.decode([nxt])
-        rows.append([i, repr(piece), round(float(probs_full[nxt]), 4),
+        piece = "" if nxt >= enc.n_vocab else enc.decode([nxt])
+        rows.append([i, _show(enc, nxt), round(float(probs_full[nxt]), 4),
                      round(entropy, 3), top5])
         text += piece
         idx = torch.cat([idx, torch.tensor([[nxt]])], dim=1)
-        if nxt == enc.eot_token:
+        if nxt == enc.eot_token or nxt >= enc.n_vocab:
             break
         if i % 4 == 0 or i == int(max_tokens) - 1:
             yield text, rows
 
     _last_probs = rows
     rate = len(rows) / max(1e-6, time.time() - t0)
-    yield text + f"\n\n[{len(rows)} tokens, {rate:.1f} tok/s on cpu]", rows
+    suffix = f"\n\n[{len(rows)} tokens, {rate:.1f} tok/s on cpu]" if stats else ""
+    yield text + suffix, rows
+
+
+def generate_with_override(choice: str, override_path: str, prompt: str, max_tokens: int,
+                           temperature: float, top_k: int, greedy: bool):
+    """A typed-in path wins over the dropdown selection."""
+    yield from generate_stream(override_path.strip() or choice, prompt, max_tokens,
+                               temperature, top_k, greedy)
+
+
+def _turns(history, message: str) -> list[tuple[str, str]]:
+    out = []
+    for turn in history or []:
+        if isinstance(turn, dict):
+            out.append((turn["role"], turn["content"]))
+        else:
+            out.append(("user", turn[0]))
+            out.append(("assistant", turn[1]))
+    out.append(("user", message))
+    return out
 
 
 def chat_fn(message: str, history, choice: str, max_tokens: int, temperature: float, top_k: int):
-    """A base LM has no chat training. This just formats the transcript as plain
-    text and continues it, which is the honest way to poke at a pretrained model.
+    """Argument order is fixed by gr.ChatInterface: (message, history, *extras).
 
-    Argument order is fixed by gr.ChatInterface: (message, history, *extras).
+    An instruction-tuned checkpoint gets its real <|user|> / <|assistant|> turn
+    tokens. A base checkpoint has never seen a conversation, so the honest thing
+    is to lay the transcript out as plain text and let it continue.
     """
-    transcript = ""
-    for turn in history or []:
-        if isinstance(turn, dict):
-            transcript += f"{turn['role'].capitalize()}: {turn['content']}\n"
-        else:
-            transcript += f"User: {turn[0]}\nAssistant: {turn[1]}\n"
-    transcript += f"User: {message}\nAssistant:"
-    reply = ""
-    for text, _ in generate_stream(choice, transcript, max_tokens, temperature, top_k, False):
-        reply = text[len(transcript) :].split("\nUser:")[0]
-        yield reply
+    if not _model_cache:
+        msg = load_checkpoint(choice)
+        if not _model_cache:
+            yield msg
+            return
+    entry = _active()
+    enc = get_tokenizer()
+    turns = _turns(history, message)
+
+    if entry["sft"]:
+        u, a = entry["user_token"], entry["assistant_token"]
+        ids: list[int] = []
+        for role, content in turns:
+            ids += [u if role == "user" else a] + enc.encode_ordinary(content)
+        ids.append(a)
+        for text, _ in generate_stream(choice, "", max_tokens, temperature, top_k,
+                                       False, prefix_ids=ids, stats=False):
+            yield text.strip()
+        return
+
+    transcript = "".join(f"{role.capitalize()}: {content}\n" for role, content in turns)
+    transcript += "Assistant:"
+    for text, _ in generate_stream(choice, transcript, max_tokens, temperature, top_k,
+                                   False, stats=False):
+        yield text[len(transcript):].split("\nUser:")[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -376,6 +440,9 @@ def build_app(run_dir: str, refresh_s: float):
                                    label="checkpoint", scale=4)
                 b_scan = gr.Button("rescan", scale=1)
                 b_load = gr.Button("load", variant="primary", scale=1)
+            ckpt_path = gr.Textbox(
+                label="or point at a file directly (overrides the dropdown)",
+                placeholder=r"C:\path\to\milestone_step0004180.pt", lines=1)
             load_msg = gr.Markdown()
             prompt = gr.Textbox(value="The mitochondrion is", lines=4, label="prompt")
             with gr.Row():
@@ -394,8 +461,9 @@ def build_app(run_dir: str, refresh_s: float):
             )
             b_scan.click(lambda d: gr.update(choices=checkpoint_choices(Path(d))),
                          [run_dir_box], ckpt)
-            b_load.click(load_checkpoint, [ckpt], load_msg)
-            b_gen.click(generate_stream, [ckpt, prompt, max_tok, temp, topk, greedy], [out, probs])
+            b_load.click(load_checkpoint, [ckpt, ckpt_path], load_msg)
+            b_gen.click(generate_with_override,
+                        [ckpt, ckpt_path, prompt, max_tok, temp, topk, greedy], [out, probs])
 
         with gr.Tab("chat"):
             gr.Markdown("This is a base language model with no instruction tuning, so it will "

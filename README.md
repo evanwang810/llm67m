@@ -38,6 +38,8 @@ Repeat step 4 until it sounds good. On the final session add `--decay`.
 | `train.py` | DDP, fp16, WSD schedule, resume, deadline, atomic saves |
 | `dashboard.py` | Gradio UI: live graphs, progress bar, save button, completions, chat |
 | `monitor.py` | terminal version of the same thing, ASCII loss chart included |
+| `finetune.py` | instruction tuning on top of a pretrained checkpoint |
+| `kaggle_run.sh` | one command for a whole session, takes an hour budget |
 | `runstate.py` | the CSV / status / flag-file protocol both sides speak |
 | `tokenize_fineweb.py` | local pre-tokenization to shards |
 | `check_resume.py` | proves a resume was clean |
@@ -114,6 +116,29 @@ most. 2B is an acceptable minimum if your download speed is the problem.
 - **15 GB per GPU.** Default micro-batch 8 at 1024 context is comfortable. If
   you hit OOM, halve `--micro-batch` and double `--grad-accum` to keep the
   global batch identical.
+
+## Instruction tuning
+
+```bash
+python finetune.py --run-dir run --hours 0.4
+```
+
+Finds the newest pretrained checkpoint on its own, trains on Alpaca-cleaned, and
+writes `sft_step*.pt` beside it. Twenty to forty minutes on one GPU is plenty.
+
+Two things make it work. The vocab is padded to 50304 while GPT-2 BPE only uses
+0 to 50256, so slots 50257 and 50258 are unclaimed embedding rows that become
+real `<|user|>` and `<|assistant|>` turn tokens rather than a text delimiter the
+model could confuse with prose. And the loss is masked over the prompt, so only
+response tokens produce a gradient: the model learns to answer rather than to
+re-generate the question. The dashboard reads the `sft` flag in the checkpoint
+and switches the chat tab to that format automatically.
+
+Set expectations. A 57M model learns the *shape* of answering and stays
+factually hopeless. It is a great "watch the format click" exercise and not an
+assistant. If you want something that feels good to talk to, tune on one narrow
+task instead of general question answering, because single-task behaviour is
+learnable at this size in a way open-domain QA is not.
 
 ## Why not the TPU
 

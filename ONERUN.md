@@ -41,38 +41,77 @@ cell 1.
 
 ---
 
-## 3. Paste one cell
+## 3. Paste the cells
 
-That is the whole notebook. Two lines, one cell:
+Pick one of two paths. Both end up in the same place.
+
+### Path A: walk away (most reliable)
+
+**Cell 1**, pretraining. This is the long one.
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!bash /kaggle/working/code/kaggle_run.sh 11
+!bash /kaggle/working/code/kaggle_run.sh 9
 ```
 
-The number is your **total** budget in hours, including tokenizing. Everything
-else is derived from it: how long to train, when to start decaying the learning
-rate, and how often to keep a permanent snapshot. Nine hours instead? Change the
-`11` to a `9`.
-
-Two more optional arguments, in this order:
+**Cell 2**, instruction tuning. Optional, but this is what makes the chat tab do
+anything. Takes about 25 minutes on top of cell 1.
 
 ```python
-!bash /kaggle/working/code/kaggle_run.sh 11 1session 1.5e9
-#                                        ^^  ^^^^^^^^ ^^^^^^
-#                                     hours   preset   tokens to prepare
+!cd /kaggle/working/code && python finetune.py --run-dir /kaggle/working/run --hours 0.4
 ```
 
-**Why one cell and not two.** Multiple cells means state that can go stale.
-Kaggle rebuilds the container when an interactive session idles out, which wipes
-`/kaggle/working` including your clone and your tokens, and then a later cell
-fails with `No such file or directory: '/kaggle/working/code'`. One cell that
-does everything from scratch cannot get out of sync with itself.
+Then **Save Version -> Save & Run All**. Both cells run in order, unattended.
 
-It is also safe to re-run. Tokenizing resumes where it stopped, and training
-resumes from the newest checkpoint it can find, so nothing is wasted.
+### Path B: watch it happen (press the run arrow)
 
-Do not run it yet.
+**Cell 1**, starts pretraining in the background so the next cell can run:
+
+```python
+import os, subprocess
+!rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
+log = open("/kaggle/working/train.log", "w")
+subprocess.Popen(["bash", "/kaggle/working/code/kaggle_run.sh", "9"],
+                 stdout=log, stderr=subprocess.STDOUT,
+                 env=dict(os.environ, PYTHONUNBUFFERED="1"))
+print("started")
+```
+
+**Cell 2**, the live view, drawn right in the cell:
+
+```python
+import sys; sys.path.insert(0, "/kaggle/working/code")
+import dashboard
+dashboard.watch_inline("/kaggle/working/run", interval=20)
+```
+
+For the first fifteen minutes or so it will say "nothing to report" while it
+downloads and tokenizes. That is normal. `!tail -20 /kaggle/working/train.log`
+in another cell shows that stage. Once training starts you get progress bars,
+stat cards and a refreshing loss curve until it finishes.
+
+**Cell 3**, instruction tuning, after cell 2 says training finished:
+
+```python
+!cd /kaggle/working/code && python finetune.py --run-dir /kaggle/working/run --hours 0.4
+```
+
+Run the cells with the arrow, leave the tab open. No Save Version needed.
+
+### About the number
+
+`9` is your **total** budget in hours. Everything else is derived from it: how
+long to train, when to start decaying the learning rate, how often to keep a
+permanent snapshot. Two more optional arguments after it:
+
+```python
+!bash /kaggle/working/code/kaggle_run.sh 9 1session 1.5e9
+#                                        ^  ^^^^^^^^ ^^^^^^
+#                                    hours    preset  tokens to prepare
+```
+
+Safe to re-run. Tokenizing resumes where it stopped and training resumes from
+the newest checkpoint, so nothing is wasted.
 
 ---
 
@@ -85,21 +124,22 @@ option 1. Then come back here.
 
 ---
 
-## 5. Press the button
+## 5. Start it
 
-**Save Version**, top right. In the dialog:
+**Path A:** **Save Version** (top right) -> **Save & Run All (Commit)** ->
+**Save**. It now runs on Kaggle's machines. You *may* close the tab, you do not
+have to. Nothing depends on your browser staying open.
 
-- Version type: **Save & Run All (Commit)**
-- **Save**
+**Path B:** click the run arrow on cell 1, then cell 2. Leave the tab open.
 
-Close the tab. It now runs on Kaggle's machines whether or not your laptop is on.
+The difference in one line: an interactive session gets shut down after roughly
+20 to 60 minutes with no cell running, and when that happens the container is
+rebuilt and `/kaggle/working` is wiped, tokens and checkpoints included. Path B
+keeps a cell running the whole time, so it survives, but a long laptop sleep or
+a dropped connection can still lose it. Path A cannot lose it.
 
-**This part is not optional.** If you instead click the run arrow on the cell and
-leave the tab open, you are in an interactive session, and Kaggle shuts those
-down after roughly 20 to 60 minutes of no interaction. When it does, the
-container is rebuilt and `/kaggle/working` is wiped, so your tokens and your
-checkpoints go with it. That is the single most common way this fails. Commit
-the run.
+If you want both, commit the run and watch its streaming log: **Versions** tab,
+click the running version.
 
 What it does with the eleven hours: about 25 minutes downloading and tokenizing
 1.5 billion tokens of FineWeb-Edu, then roughly ten hours of training, then it
