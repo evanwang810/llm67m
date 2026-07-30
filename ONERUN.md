@@ -41,38 +41,38 @@ cell 1.
 
 ---
 
-## 3. Paste the two cells
+## 3. Paste one cell
 
-**Cell 1**, the empty one already there:
-
-```python
-!pip install -q tiktoken datasets
-!git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-%cd /kaggle/working/code
-!python tokenize_fineweb.py --out-dir /kaggle/working/tokens --max-tokens 1.5e9
-```
-
-Click **+ Code** to add a second cell.
-
-**Cell 2**:
+That is the whole notebook. Two lines, one cell:
 
 ```python
-%cd /kaggle/working/code
-!torchrun --nproc_per_node=2 train.py \
-    --preset 1session \
-    --data-dir /kaggle/working/tokens \
-    --run-dir /kaggle/working/run \
-    --deadline-hours 10.5 \
-    --auto-decay --decay-steps 1200 \
-    --keep-checkpoints 1 --keep-weights 2 --milestone-every-min 75
+!rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
+!bash /kaggle/working/code/kaggle_run.sh 11
 ```
 
-That last line is what gives you something to compare afterwards. Every 75
-minutes it keeps a permanent 114 MB `milestone_step*.pt`, so you finish with
-about eight snapshots spanning the whole run and can put the two-hour model and
-the ten-hour model against the same prompt in the dashboard.
+The number is your **total** budget in hours, including tokenizing. Everything
+else is derived from it: how long to train, when to start decaying the learning
+rate, and how often to keep a permanent snapshot. Nine hours instead? Change the
+`11` to a `9`.
 
-Do not run anything yet.
+Two more optional arguments, in this order:
+
+```python
+!bash /kaggle/working/code/kaggle_run.sh 11 1session 1.5e9
+#                                        ^^  ^^^^^^^^ ^^^^^^
+#                                     hours   preset   tokens to prepare
+```
+
+**Why one cell and not two.** Multiple cells means state that can go stale.
+Kaggle rebuilds the container when an interactive session idles out, which wipes
+`/kaggle/working` including your clone and your tokens, and then a later cell
+fails with `No such file or directory: '/kaggle/working/code'`. One cell that
+does everything from scratch cannot get out of sync with itself.
+
+It is also safe to re-run. Tokenizing resumes where it stopped, and training
+resumes from the newest checkpoint it can find, so nothing is wasted.
+
+Do not run it yet.
 
 ---
 
@@ -93,6 +93,13 @@ option 1. Then come back here.
 - **Save**
 
 Close the tab. It now runs on Kaggle's machines whether or not your laptop is on.
+
+**This part is not optional.** If you instead click the run arrow on the cell and
+leave the tab open, you are in an interactive session, and Kaggle shuts those
+down after roughly 20 to 60 minutes of no interaction. When it does, the
+container is rebuilt and `/kaggle/working` is wiped, so your tokens and your
+checkpoints go with it. That is the single most common way this fails. Commit
+the run.
 
 What it does with the eleven hours: about 25 minutes downloading and tokenizing
 1.5 billion tokens of FineWeb-Edu, then roughly ten hours of training, then it
@@ -375,5 +382,7 @@ bug and want to do that, the resume machinery is all there:
 | `no meta.json in /kaggle/working/tokens` | cell 1 did not finish. Check its output for a download error |
 | `ModuleNotFoundError: tiktoken` | Internet was Off when it ran |
 | `fatal: could not read from remote repository` | Internet was Off, or the repo is private |
+| `No such file or directory: '/kaggle/working/code'` | the session restarted and wiped `/kaggle/working`. Re-run the one cell, and commit the real run instead of running interactively |
+| `found 1 gpu(s), not 2` | Accelerator is not set to **GPU T4 x2**. It will still train, just at half speed |
 | no `gradio.live` link printed | you forgot `share=True`, or Internet is Off |
 | session died around 9 hours | Kaggle was busy. Lower `--deadline-hours` to 8 and rerun |
