@@ -111,11 +111,6 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     max_tokens, val_tokens, shard_tokens = int(args.max_tokens), int(args.val_tokens), int(args.shard_tokens)
 
-    import tiktoken
-    from datasets import load_dataset
-
-    vocab_size = tiktoken.get_encoding(args.encoding).n_vocab
-
     skip_docs, existing_train, existing_val, done_tokens = 0, [], [], 0
     meta_path = out_dir / "meta.json"
     if meta_path.exists():
@@ -126,9 +121,16 @@ def main() -> None:
         done_tokens = old.get("total_tokens", 0)
         print(f"resuming: {done_tokens / 1e9:.3f}B tokens already written, "
               f"skipping {skip_docs:,} documents")
+        # Check before importing datasets, so a re-run with complete shards
+        # needs neither the package nor the network.
         if done_tokens >= max_tokens:
             print("already at the requested token count, nothing to do")
             return
+
+    import tiktoken
+    from datasets import load_dataset
+
+    vocab_size = tiktoken.get_encoding(args.encoding).n_vocab
 
     print(f"streaming {args.dataset} [{args.name}] with {args.workers} workers")
     ds = load_dataset(args.dataset, name=args.name, split=args.split, streaming=True)

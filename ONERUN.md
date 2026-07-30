@@ -45,14 +45,32 @@ cell 1.
 
 Pick one of two paths. Both end up in the same place.
 
+|  | Path A, commit | Path B, press run |
+| --- | --- | --- |
+| tab must stay open | no | yes, all 9 hours |
+| laptop must stay awake | no | yes |
+| survives a dropped connection | yes | probably not |
+| survives you forgetting about it | yes | no |
+| see progress while it runs | status blocks with a loss chart, in the log | live bars and a refreshing chart |
+| chat with a checkpoint mid-run | no | yes |
+
+Path A is the one to use. The gap in what you can see is now small, because it
+prints the same charts into the log every five minutes.
+
 ### Path A: walk away (most reliable)
 
 **Cell 1**, pretraining. This is the long one.
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!bash /kaggle/working/code/kaggle_run.sh 9
+!MONITOR=1 bash /kaggle/working/code/kaggle_run.sh 9
 ```
+
+`MONITOR=1` is what makes the run watchable. Training goes to the background and
+the terminal monitor takes the foreground, so instead of a wall of step lines
+your log gets a status block every five minutes: progress bars, a stat table,
+and an ASCII loss chart. Open the **Versions** tab any time, from any device, to
+read it. Drop the `MONITOR=1` if you would rather have the raw stream.
 
 **Cell 2**, instruction tuning. Optional, but this is what makes the chat tab do
 anything. Takes about 25 minutes on top of cell 1.
@@ -63,7 +81,14 @@ anything. Takes about 25 minutes on top of cell 1.
 
 Then **Save Version -> Save & Run All**. Both cells run in order, unattended.
 
+**Do you have to sit there?** No. Nothing depends on your browser. Check in
+whenever, or not at all.
+
 ### Path B: watch it happen (press the run arrow)
+
+Only worth it if you want to chat with a half-trained checkpoint while it cooks.
+You must leave the tab open and the machine awake for the full nine hours, and a
+long sleep or a dropped connection can still cost you the run.
 
 **Cell 1**, starts pretraining in the background so the next cell can run:
 
@@ -115,12 +140,18 @@ the newest checkpoint, so nothing is wasted.
 
 ---
 
-## 4. Optional but recommended: a 30 minute shakedown first
+## 4. Optional: a 3 minute pre-flight
 
-Eleven hours is a long time to find out cell 2 had a typo. Before committing,
-spend half an hour of quota proving the whole thing works, with the dashboard
-in front of you. See [the frontend section](#5-seeing-the-frontend-on-kaggle),
-option 1. Then come back here.
+Nine hours is a long time to find out something was misconfigured. Add a cell,
+run just this, wait about three minutes:
+
+```python
+!SMOKE=1 MONITOR=1 bash /kaggle/working/code/kaggle_run.sh 0.2
+```
+
+Same code path, tiny model, synthetic data, no download. If you see the
+parameter report, a falling loss, the status chart, and `training finished`,
+then your real run will work too. Delete the cell afterwards.
 
 ---
 

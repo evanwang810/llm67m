@@ -1,5 +1,9 @@
 # Kaggle notebook cells, copy and paste
 
+> **Doing one run? This is not the file you want.** Go to
+> [ONERUN.md](ONERUN.md). This is a reference sheet of raw cells for the
+> multi-session setup, kept for when you need to assemble something custom.
+
 For the click-by-click version see [QUICKSTART.md](QUICKSTART.md). This file is
 just the cells.
 

@@ -1,4 +1,13 @@
-﻿# Quickstart, all in the browser
+﻿> **Doing one run? This is not the file you want.** Go to
+> [ONERUN.md](ONERUN.md): two cells, one button, done.
+>
+> This file is the multi-week version, where you stack six or ten sessions to
+> reach 6B or 8B tokens. It is longer only because state has to survive between
+> sessions: a separate tokenize notebook so you do not redo it, a checkpoint
+> dataset to carry the model forward, and the attach-and-rerun loop each time.
+> None of that is needed for a single session.
+
+# Quickstart, all in the browser
 
 Nothing runs on your laptop. Five clicks-and-wait stages, and only stage 5
 repeats.

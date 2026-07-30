@@ -22,10 +22,17 @@ RUN="${RUN_DIR:-/kaggle/working/run}"
 echo "=== llm67m: ${HOURS}h budget, preset ${PRESET}, ${MAX_TOKENS} tokens ==="
 cd "$CODE"
 
-pip install -q tiktoken datasets
+if [ "${SKIP_PIP:-0}" != "1" ]; then
+  pip install -q tiktoken datasets
+fi
 
-# Resumable: if meta.json already has enough tokens this returns immediately.
-python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS"
+if [ "${SMOKE:-0}" = "1" ]; then
+  # Whole pipeline in a few minutes on synthetic data, same code path.
+  echo "SMOKE=1: skipping tokenization, training a tiny model on generated data"
+else
+  # Resumable: if meta.json already has enough tokens this returns immediately.
+  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS"
+fi
 
 # Reserve time for tokenizing, and derive the schedule knobs from the budget:
 # decay over roughly the last 15% of steps, and about 8 permanent milestones.
@@ -51,11 +58,31 @@ fi
 echo "=== training ${TRAIN_HOURS}h on ${NGPU} gpu, decay ${DECAY_STEPS} steps, "\
 "milestone every ${MILESTONE_MIN} min ==="
 
-exec "${LAUNCH[@]}" train.py \
-  --preset "$PRESET" \
-  --data-dir "$TOKENS" \
-  --run-dir "$RUN" \
-  --deadline-hours "$TRAIN_HOURS" \
-  --auto-decay --decay-steps "$DECAY_STEPS" \
-  --keep-checkpoints 1 --keep-weights 2 \
-  --milestone-every-min "$MILESTONE_MIN"
+TRAIN_CMD=("${LAUNCH[@]}" train.py
+  --preset "$PRESET"
+  --data-dir "$TOKENS"
+  --run-dir "$RUN"
+  --deadline-hours "$TRAIN_HOURS"
+  --auto-decay --decay-steps "$DECAY_STEPS"
+  --keep-checkpoints 1 --keep-weights 2
+  --milestone-every-min "$MILESTONE_MIN")
+
+if [ "${SMOKE:-0}" = "1" ]; then
+  TRAIN_CMD+=(--smoke-test --max-steps "${SMOKE_STEPS:-80}")
+fi
+
+if [ "${MONITOR:-0}" = "1" ]; then
+  # Train in the background and put the monitor in front, so a committed run's
+  # log becomes readable status blocks with a loss chart instead of a wall of
+  # step lines. --until-done ends the cell as soon as the final checkpoint
+  # lands, or bails out and dumps the log if the trainer dies.
+  mkdir -p "$RUN"
+  echo "monitor mode: full training output goes to $RUN/train.log"
+  PYTHONUNBUFFERED=1 "${TRAIN_CMD[@]}" > "$RUN/train.log" 2>&1 &
+  TRAIN_PID=$!
+  trap 'kill $TRAIN_PID 2>/dev/null || true' EXIT
+  exec python monitor.py --run-dir "$RUN" --watch \
+    --interval "${MONITOR_INTERVAL:-300}" --until-done --no-color
+fi
+
+exec "${TRAIN_CMD[@]}"
