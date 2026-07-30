@@ -487,6 +487,7 @@ def main() -> None:
     last_log_t = time.time()
     last_log_step = step
     secs_per_step = 0.0
+    lr = lr_at(step, args, decay_start)  # so the final status is valid even if we break at once
     val_loss: float | None = None
     stop_reason = ""
 
@@ -660,7 +661,7 @@ def main() -> None:
             "max_steps": args.max_steps or None,
             "elapsed_s": time.time() - session_start, "remaining_s": 0,
             "deadline_hours": args.deadline_hours, "epoch": sampler.epoch_at(step),
-            "tok_per_s": None, "secs_per_step": secs_per_step,
+            "tok_per_s": None, "secs_per_step": secs_per_step, "lr": lr,
             "alive": False, "stop_reason": stop_reason, "final_checkpoint": p.name,
             "run_dir": str(run_dir), "last_save_step": step,
             "tokens_per_step": tokens_per_step, "world_size": world,

@@ -428,11 +428,57 @@ def build_app(run_dir: str, refresh_s: float):
     return demo, launch_extra
 
 
-def launch(run_dir: str, refresh: float = 5.0, share: bool = True, port: int = 7860):
-    """Convenience entry point for a notebook cell."""
+def launch(run_dir: str, refresh: float = 5.0, share: bool = True, port: int = 7860,
+           inline: bool | None = None, blocking: bool = True):
+    """Convenience entry point for a notebook cell.
+
+    inline=True embeds the whole UI in the cell output instead of only printing
+    a link. On Kaggle that iframe points at the share URL, so share must stay
+    True; there is no port forwarding to fall back on.
+
+    blocking=False returns immediately and keeps serving from a background
+    thread, so you can carry on running other cells while the UI stays up.
+    """
     Path(run_dir).mkdir(parents=True, exist_ok=True)
     demo, extra = build_app(run_dir, refresh)
-    return demo.queue().launch(share=share, server_port=port, server_name="0.0.0.0", **extra)
+    return demo.queue().launch(
+        share=share, server_port=port, server_name="0.0.0.0",
+        inline=inline, prevent_thread_lock=not blocking, **extra,
+    )
+
+
+def watch_inline(run_dir: str = "/kaggle/working/run", interval: float = 15.0,
+                 count: int = 0, until_done: bool = True):
+    """Live status cards and loss chart drawn straight into the cell output.
+
+    No web server, no share link, no tunnel, so nothing here can be blocked by
+    Kaggle's networking. The trade is that it is a view and not an app: no
+    buttons, no prompt box. For those, use launch(inline=True).
+    """
+    from IPython.display import HTML, clear_output, display
+
+    rs = RunDir(run_dir)
+    shown = 0
+    while True:
+        body, fig = render_live(run_dir)
+        clear_output(wait=True)
+        display(HTML(f"<div style='background:#0d0f16;padding:16px;border-radius:12px'>{body}</div>"))
+        if fig is not None:
+            display(fig)
+            plt.close(fig)
+        shown += 1
+
+        st = rs.read_status()
+        if until_done and st and st.get("stop_reason"):
+            print(f"training finished: {st['stop_reason']}, "
+                  f"final checkpoint {st.get('final_checkpoint')}")
+            return
+        if count and shown >= count:
+            return
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return
 
 
 def main() -> None:

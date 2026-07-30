@@ -140,13 +140,99 @@ That is what one T4 session buys, and it is a genuinely fun thing to poke at.
 
 # Seeing the frontend on Kaggle
 
-First the constraint, because it explains the three options. Kaggle gives you no
-port forwarding, so `localhost:7860` is unreachable either way. The only route to
-a UI is Gradio's `share=True` tunnel, which prints a public `*.gradio.live` link
-and needs **Internet On**. And a committed run (Save & Run All) executes headless
-with no way to interact, so it cannot serve a UI at all while it runs.
+First the constraint, because it explains the options. Kaggle gives you no port
+forwarding, so `localhost:7860` is unreachable either way. Kaggle also has no
+equivalent of Colab's `serve_kernel_port_as_iframe`. The only route to an
+interactive UI is Gradio's `share=True` tunnel, which prints a public
+`*.gradio.live` link and needs **Internet On**. And a committed run (Save & Run
+All) executes headless with no way to interact, so it cannot serve a UI at all
+while it runs.
 
-So: you cannot watch a committed run live. Pick one of these instead.
+So you cannot watch a committed run live. Pick one of these instead.
+
+## Option 0: the terminal monitor, no browser involved
+
+Works everywhere, including inside a committed run. Progress bars, stat table,
+and an ASCII loss chart printed straight to the log.
+
+```bash
+python monitor.py --run-dir /kaggle/working/run                 # one snapshot
+python monitor.py --run-dir /kaggle/working/run --watch         # every 30s
+python monitor.py --run-dir /kaggle/working/run --last 2000     # zoom the chart
+```
+
+```
+  session  [######################------------------------] 5h12m40s / 10h30m00s
+
+  step         4,180           phase        constant        train loss   3.8241
+  perplexity   45.8            val loss     3.8902          best val     3.8902
+  throughput   28.4k tok/s     sec/step     4.61            tokens seen  0.548B
+
+  cross entropy (whole run) . raw   o ema   V val
+  10.518 |o  o  o
+         |   .     o  o
+         |               o
+   6.421 |                    V V   .     .   .
+         +----------------------------------------
+```
+
+The dashboard's three buttons are flags here:
+
+```bash
+python monitor.py --save     # checkpoint now
+python monitor.py --decay    # start the lr decay phase
+python monitor.py --stop     # final checkpoint, then exit cleanly
+```
+
+To get those status blocks into a **committed** run's log, start training in the
+background and put the monitor in the foreground:
+
+```python
+import os, subprocess, sys
+os.makedirs("/kaggle/working/run", exist_ok=True)
+log = open("/kaggle/working/run/train.log", "w")
+subprocess.Popen(
+    [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2", "train.py",
+     "--preset", "1session", "--data-dir", "/kaggle/working/tokens",
+     "--run-dir", "/kaggle/working/run", "--deadline-hours", "10.5",
+     "--auto-decay", "--decay-steps", "1200",
+     "--keep-checkpoints", "1", "--keep-weights", "2", "--milestone-every-min", "75"],
+    cwd="/kaggle/working/code", stdout=log, stderr=subprocess.STDOUT,
+    env=dict(os.environ, PYTHONUNBUFFERED="1"),
+)
+!python monitor.py --run-dir /kaggle/working/run --watch --interval 300 --until-done
+```
+
+`--until-done` makes the monitor exit as soon as training writes its final
+checkpoint, or bail out and dump the last 40 log lines if the trainer dies. That
+keeps the cell from burning hours on a dead run.
+
+## Option 0b: the real UI, embedded in the notebook cell
+
+Closest thing to what Colab does. Two flavours, both in an **interactive**
+session.
+
+A live view with no server and no tunnel at all, drawn directly into the cell
+output and refreshed in place:
+
+```python
+import sys; sys.path.insert(0, "/kaggle/working/code")
+import dashboard
+dashboard.watch_inline("/kaggle/working/run", interval=15)
+```
+
+Or the whole clickable app embedded in the cell, which does need the share
+tunnel because the iframe has to point somewhere your browser can reach:
+
+```python
+import sys; sys.path.insert(0, "/kaggle/working/code")
+import dashboard
+dashboard.launch("/kaggle/working/run", share=True, inline=True, blocking=False)
+```
+
+`blocking=False` is the useful part: the cell returns immediately and the server
+keeps running in a background thread, so you can keep using other cells while
+the UI stays up.
 
 ## Option 1: interactive shakedown, dashboard live (recommended)
 

@@ -37,6 +37,7 @@ Repeat step 4 until it sounds good. On the final session add `--decay`.
 | `data.py` | O(1)-resumable deterministic loader over uint16 shards |
 | `train.py` | DDP, fp16, WSD schedule, resume, deadline, atomic saves |
 | `dashboard.py` | Gradio UI: live graphs, progress bar, save button, completions, chat |
+| `monitor.py` | terminal version of the same thing, ASCII loss chart included |
 | `runstate.py` | the CSV / status / flag-file protocol both sides speak |
 | `tokenize_fineweb.py` | local pre-tokenization to shards |
 | `check_resume.py` | proves a resume was clean |
@@ -195,6 +196,13 @@ Training exits automatically once the decay phase completes.
 ```bash
 python dashboard.py --run-dir run          # local, on a downloaded run folder
 python dashboard.py --run-dir /kaggle/working/run --share   # on Kaggle
+```
+
+No browser at all:
+
+```bash
+python monitor.py --run-dir run --watch      # bars, stats, ascii loss chart
+python monitor.py --save                     # same three buttons, as flags
 ```
 
 CPU only, so it never touches your GPU quota. On Kaggle `--share` is mandatory:
