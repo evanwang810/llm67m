@@ -270,6 +270,8 @@ def main() -> None:
                    help="--until-done treats a heartbeat older than this as a dead trainer")
     p.add_argument("--pid", type=int, default=0,
                    help="watch this process instead of guessing from the heartbeat")
+    p.add_argument("--exit-file", default="",
+                   help="with --until-done, stop when this file appears; it holds the exit code")
     p.add_argument("--last", type=int, default=0, help="chart only the last N steps, 0 is all")
     p.add_argument("--width", type=int, default=98, help="chart width in columns")
     p.add_argument("--height", type=int, default=22, help="chart height in rows")
@@ -317,10 +319,28 @@ def main() -> None:
                 print(f"\n{c['green']}training finished: {st['stop_reason']}, "
                       f"final checkpoint {st.get('final_checkpoint')}{c['reset']}")
                 return
-            # If we were given the trainer's pid, that is the authority. A stale
+            # An explicit marker file is the authority when we have one. A stale
             # heartbeat only means rank 0 is busy (a long save, a restart in
-            # progress); killing the cell there would abort a run that the
-            # restart loop was about to rescue.
+            # progress); ending the run there would abort something the restart
+            # loop was about to rescue.
+            if args.exit_file:
+                marker = Path(args.exit_file)
+                if not marker.exists():
+                    print(f"\n{c['dim']}refreshing in {args.interval:.0f}s, "
+                          f"ctrl-c to stop{c['reset']}\n", flush=True)
+                    try:
+                        time.sleep(args.interval)
+                    except KeyboardInterrupt:
+                        return
+                    continue
+                code = marker.read_text().strip()
+                if code == "0":
+                    print(f"\n{c['green']}training finished cleanly{c['reset']}")
+                    return
+                print(f"\n{c['red']}training exited {code}{c['reset']}")
+                _dump_log(args, c)
+                raise SystemExit(1)
+
             if args.pid:
                 if _pid_alive(args.pid):
                     print(f"\n{c['dim']}refreshing in {args.interval:.0f}s, "

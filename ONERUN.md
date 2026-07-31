@@ -59,27 +59,28 @@ prints the same charts into the log every five minutes.
 
 ### Path A: walk away (most reliable)
 
-**Cell 1**, pretraining. This is the long one.
+**One cell. That is the whole notebook.**
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!MONITOR=1 bash /kaggle/working/code/kaggle_run.sh 9
+!MONITOR=1 SFT_HOURS=0.4 bash /kaggle/working/code/kaggle_run.sh 9
 ```
 
-`MONITOR=1` is what makes the run watchable. Training goes to the background and
-the terminal monitor takes the foreground, so instead of a wall of step lines
-your log gets a status block every five minutes: progress bars, a stat table,
-and an ASCII loss chart. Open the **Versions** tab any time, from any device, to
-read it. Drop the `MONITOR=1` if you would rather have the raw stream.
+Then **Save Version -> Save & Run All**.
 
-**Cell 2**, instruction tuning. Optional, but this is what makes the chat tab do
-anything. Takes about 25 minutes on top of cell 1.
+`MONITOR=1` makes the run watchable: training goes to the background and the
+terminal monitor takes the foreground, so instead of a wall of step lines your
+log gets a status block every five minutes with progress bars, a stat table and
+a loss chart. Open the **Versions** tab any time, from any device, to read it.
 
-```python
-!cd /kaggle/working/code && python finetune.py --run-dir /kaggle/working/run --hours 0.4
-```
+`SFT_HOURS=0.4` runs instruction tuning after pretraining, which is what makes
+the model answer questions rather than just continue text. It only runs if
+training actually succeeded, so it can never quietly re-tune a stale checkpoint
+from a previous session. Drop it to skip fine-tuning.
 
-Then **Save Version -> Save & Run All**. Both cells run in order, unattended.
+Fine-tuning used to be a second cell, which was a mistake: a notebook keeps
+going after a failed cell, so a broken cell 1 would leave cell 2 happily tuning
+a months-old checkpoint and looking like it worked.
 
 **Do you have to sit there?** No. Nothing depends on your browser. Check in
 whenever, or not at all.
@@ -125,26 +126,26 @@ Run the cells with the arrow, leave the tab open. No Save Version needed.
 
 ### A second session, continuing from the first
 
-Attach the finished notebook's output (**+ Add Input -> Notebook Output ->**
-`llm67m-run`), then use this as cell 1 instead. Point `RESUME_FROM` at the
-`ckpt_step*.pt` in it, and `TOKENS_DIR` at the tokens you already made, so
-neither is redone:
+New notebook, same settings. **+ Add Input -> Notebook Output ->** your finished
+`llm67m-run`. Then the cell is **exactly the same as the first session**:
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!MONITOR=1 \
- RESUME_FROM=/kaggle/input/llm67m-run/run/ckpt_step0010125.pt \
- TOKENS_DIR=/kaggle/input/llm67m-run/tokens \
- bash /kaggle/working/code/kaggle_run.sh 9
+!MONITOR=1 SFT_HOURS=0.4 bash /kaggle/working/code/kaggle_run.sh 10.5
 ```
 
-Change the step number to whatever the file is actually called, check it in the
-file browser on the right. A wrong path fails immediately with a clear message
-rather than quietly starting from scratch.
+No paths to type. It searches `/kaggle/input` for the newest checkpoint and for
+an existing token set, and uses both. Tokenizing is skipped, training picks up at
+the exact step with optimizer moments and loss scale intact so the loss curve
+continues rather than spiking, and fine-tuning re-runs at the end against the new
+weights.
 
-It picks up at the exact step with optimizer moments and loss scale intact, so
-the loss curve continues rather than spiking. Keep `--preset` the same as the
-first session or it will refuse to load.
+Do not try to guess the mount path. Kaggle puts notebook output under
+`/kaggle/input/notebooks/<username>/<slug>/`, not `/kaggle/input/<slug>/`, which
+is why this looks for it instead of asking you. `RESUME_FROM=` and `TOKENS_DIR=`
+still exist if you want to pin them explicitly.
+
+Keep the preset the same across sessions, or resume will refuse to load.
 
 ### About the number
 

@@ -31,9 +31,65 @@ if [ "${SKIP_PIP:-0}" != "1" ]; then
   fi
 fi
 
+# Kaggle mounts a notebook's output at /kaggle/input/notebooks/<user>/<slug>/,
+# which nobody guesses correctly. Rather than make you type a path, go and find
+# a finished token set anywhere under /kaggle/input and use the biggest one.
+find_tokens() {
+  python - "$1" <<'PY'
+import json, sys
+from pathlib import Path
+
+want = Path(sys.argv[1])
+if (want / "meta.json").exists():
+    print(want)
+    raise SystemExit
+
+best = None
+patterns = ["meta.json", "*/meta.json", "*/*/meta.json", "*/*/*/meta.json",
+            "*/*/*/*/meta.json", "*/*/*/*/*/meta.json"]
+for root in (Path("/kaggle/input"), Path("/kaggle/working")):
+    if not root.exists():
+        continue
+    for pat in patterns:
+        for meta in root.glob(pat):
+            try:
+                m = json.loads(meta.read_text())
+            except Exception:
+                continue
+            if "shards" not in m:
+                continue
+            n = int(m.get("total_tokens", 0))
+            if n > 0 and (best is None or n > best[0]):
+                best = (n, meta.parent)
+if best:
+    print(best[1])
+PY
+}
+
 if [ "${SMOKE:-0}" = "1" ]; then
   # Whole pipeline in a few minutes on synthetic data, same code path.
   echo "SMOKE=1: skipping tokenization, training a tiny model on generated data"
+else
+  FOUND="$(find_tokens "$TOKENS" 2>/dev/null || true)"
+  if [ -n "$FOUND" ] && [ "$FOUND" != "$TOKENS" ]; then
+    echo "found existing tokens at $FOUND, using those instead of $TOKENS"
+    TOKENS="$FOUND"
+  fi
+  # Never try to write into the read-only input mount.
+  case "$TOKENS" in
+    /kaggle/input/*)
+      if [ ! -f "$TOKENS/meta.json" ]; then
+        echo "TOKENS_DIR=$TOKENS is under the read-only /kaggle/input and has no" >&2
+        echo "meta.json. Check the real path in the file browser, or unset" >&2
+        echo "TOKENS_DIR to tokenize fresh into /kaggle/working." >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
+if [ "${SMOKE:-0}" = "1" ]; then
+  :
 else
   # Resumable: if meta.json already has enough tokens this returns immediately.
   # A non-zero exit here is not conclusive. The HF streaming reader can abort
@@ -132,21 +188,37 @@ if [ "${SMOKE:-0}" = "1" ]; then
   TRAIN_CMD+=(--smoke-test --max-steps "${SMOKE_STEPS:-80}")
 fi
 
+# With MONITOR=1, train in the background and put the monitor in front, so a
+# committed run's log becomes readable status blocks with a loss chart instead
+# of a wall of step lines.
+CODE_EXIT=0
 if [ "${MONITOR:-0}" = "1" ]; then
-  # Train in the background and put the monitor in front, so a committed run's
-  # log becomes readable status blocks with a loss chart instead of a wall of
-  # step lines. --until-done ends the cell as soon as the final checkpoint
-  # lands, or bails out and dumps the log if the trainer dies.
   mkdir -p "$RUN"
+  rm -f "$RUN/train.exit"
   echo "monitor mode: full training output goes to $RUN/train.log"
-  train_with_restarts > "$RUN/train.log" 2>&1 &
+  # The marker file, not the pid, tells the monitor when to stop. A finished
+  # background job lingers as a zombie that still answers kill(pid, 0), so a
+  # liveness check would never return. A stale heartbeat is not a signal either:
+  # it just means rank 0 is mid-save or mid-restart.
+  { c=0; train_with_restarts || c=$?; echo "$c" > "$RUN/train.exit"; } \
+    > "$RUN/train.log" 2>&1 &
   TRAIN_PID=$!
-  trap 'kill $TRAIN_PID 2>/dev/null || true' EXIT
-  # Watch the pid, not the heartbeat. A long save or a restart leaves the
-  # heartbeat stale while the run is perfectly healthy, and ending the cell
-  # there would abort a run the restart loop was about to rescue.
-  exec python monitor.py --run-dir "$RUN" --watch --pid "$TRAIN_PID" \
-    --interval "${MONITOR_INTERVAL:-300}" --until-done --no-color
+  python monitor.py --run-dir "$RUN" --watch --exit-file "$RUN/train.exit" \
+    --interval "${MONITOR_INTERVAL:-300}" --until-done --no-color || true
+  wait "$TRAIN_PID" || true
+  CODE_EXIT="$(cat "$RUN/train.exit" 2>/dev/null || echo 1)"
+else
+  train_with_restarts || CODE_EXIT=$?
 fi
 
-train_with_restarts
+if [ "$CODE_EXIT" -ne 0 ]; then
+  echo "=== training failed with $CODE_EXIT, not going on to fine-tuning ===" >&2
+  exit "$CODE_EXIT"
+fi
+
+# Fine-tuning as part of the same command, so it cannot run off a stale
+# checkpoint when training never happened. Unset SFT_HOURS to skip it.
+if [ -n "${SFT_HOURS:-}" ]; then
+  echo "=== instruction tuning for ${SFT_HOURS}h ==="
+  exec python finetune.py --run-dir "$RUN" --hours "$SFT_HOURS"
+fi
