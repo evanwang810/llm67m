@@ -24,6 +24,11 @@ cd "$CODE"
 
 if [ "${SKIP_PIP:-0}" != "1" ]; then
   pip install -q tiktoken datasets
+  # Optional, for braille charts in the monitor. Not the PyPI package of the same
+  # name. Failure here is fine, the monitor falls back to ASCII.
+  if [ -n "${TERMPLOT_REPO:-}" ]; then
+    pip install -q "git+${TERMPLOT_REPO}" || echo "termplot install failed, using ascii charts"
+  fi
 fi
 
 if [ "${SMOKE:-0}" = "1" ]; then
@@ -77,6 +82,18 @@ TRAIN_CMD=("${LAUNCH[@]}" train.py
   --keep-checkpoints 1 --keep-weights 2
   --save-every-min "${SAVE_EVERY_MIN:-15}"
   --milestone-every-min "$MILESTONE_MIN")
+
+# Continuing a previous session: point at the ckpt_step*.pt from its output.
+# Without this, resume still works by globbing /kaggle/input, but being explicit
+# means a wrong path fails loudly instead of silently starting from scratch.
+if [ -n "${RESUME_FROM:-}" ]; then
+  if [ ! -f "$RESUME_FROM" ]; then
+    echo "RESUME_FROM=$RESUME_FROM does not exist" >&2
+    exit 1
+  fi
+  echo "resuming from $RESUME_FROM"
+  TRAIN_CMD+=(--resume-from "$RESUME_FROM")
+fi
 
 # A long run on free hardware will occasionally die on something outside our
 # control: a CUDA fault, an NCCL abort, a preempted GPU. Training resumes from

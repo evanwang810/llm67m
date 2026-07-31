@@ -110,6 +110,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--eval-every", type=int, default=t.eval_every)
     g.add_argument("--eval-batches", type=int, default=t.eval_batches)
     g.add_argument("--seed", type=int, default=t.seed)
+    g.add_argument("--sample-prompt", default="Once upon a time",
+                   help="generated from at every checkpoint, logged to samples.txt")
+    g.add_argument("--sample-tokens", type=int, default=48, help="0 disables sampling")
 
     g = p.add_argument_group("misc")
     g.add_argument("--compile", action="store_true")
@@ -194,6 +197,41 @@ def setup_distributed():
 # --------------------------------------------------------------------------- #
 # schedule
 # --------------------------------------------------------------------------- #
+
+
+@torch.no_grad()
+def sample_text(raw_model, device, prompt: str, max_new: int,
+                temperature: float = 0.8, top_k: int = 40) -> str:
+    """A few tokens from a fixed prompt, so the log shows quality, not just loss.
+
+    Rank 0 only, and it runs no collectives, so the other ranks simply wait a
+    second at the next barrier. Never allowed to take the run down with it.
+    """
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("gpt2")
+        was_training = raw_model.training
+        raw_model.eval()
+        ids = enc.encode_ordinary(prompt)
+        idx = torch.tensor([ids], dtype=torch.long, device=device)
+        for _ in range(max_new):
+            window = idx[:, -raw_model.cfg.block_size :]
+            logits, _ = raw_model(window)
+            logits = logits[0, -1].float() / max(1e-4, temperature)
+            if top_k:
+                kth = torch.topk(logits, min(top_k, logits.numel()))[0][-1]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            nxt = torch.multinomial(torch.softmax(logits, dim=-1), 1)
+            idx = torch.cat([idx, nxt.view(1, 1)], dim=1)
+            if int(nxt) == enc.eot_token:
+                break
+        if was_training:
+            raw_model.train()
+        out = enc.decode(idx[0].tolist())
+        return " ".join(out.split())
+    except Exception as exc:  # tokenizer missing, OOM, anything
+        return f"<sampling failed: {type(exc).__name__}: {exc}>"
 
 
 def lr_at(step: int, args: argparse.Namespace, decay_start: int | None) -> float:
@@ -481,6 +519,7 @@ def main() -> None:
     if master:
         rs.init_csv()
     loss_ema: float | None = resumed_ema
+    last_sample = ""
     last_save = time.time()
     last_milestone = time.time()
     saved_at_step = step
@@ -616,6 +655,7 @@ def main() -> None:
                     "non_embedding_params": non_embedding_params(cfg),
                     "last_save_step": saved_at_step,
                     "last_save_ago_s": round(time.time() - last_save, 1),
+                    "sample_prompt": args.sample_prompt, "sample": last_sample,
                     "run_dir": str(run_dir), "pid": os.getpid(), "alive": True,
                 })
 
@@ -639,6 +679,13 @@ def main() -> None:
                                     args.keep_weights, is_milestone)
                 print(f"saved {p.name} ({p.stat().st_size / 1e6:.0f} MB)"
                       + ("  [milestone kept]" if is_milestone else ""), flush=True)
+                if args.sample_tokens > 0:
+                    last_sample = sample_text(raw_model, device, args.sample_prompt,
+                                              args.sample_tokens)
+                    print(f'  sample @ {step}: "{last_sample}"', flush=True)
+                    with open(run_dir / "samples.txt", "a", encoding="utf-8") as f:
+                        f.write(f"step {step}\tloss {loss_ema or float('nan'):.4f}\t"
+                                f"{last_sample}\n")
             last_save = time.time()
             if is_milestone:
                 last_milestone = last_save

@@ -37,7 +37,8 @@ Repeat step 4 until it sounds good. On the final session add `--decay`.
 | `data.py` | O(1)-resumable deterministic loader over uint16 shards |
 | `train.py` | DDP, fp16, WSD schedule, resume, deadline, atomic saves |
 | `dashboard.py` | Gradio UI: live graphs, progress bar, save button, completions, chat |
-| `monitor.py` | terminal version of the same thing, ASCII loss chart included |
+| `monitor.py` | terminal version of the same thing, loss chart included |
+| `chat.py` | terminal chat and completion against any checkpoint, runs anywhere |
 | `finetune.py` | instruction tuning on top of a pretrained checkpoint |
 | `kaggle_run.sh` | one command for a whole session, takes an hour budget |
 | `runstate.py` | the CSV / status / flag-file protocol both sides speak |
@@ -226,9 +227,37 @@ python dashboard.py --run-dir /kaggle/working/run --share   # on Kaggle
 No browser at all:
 
 ```bash
-python monitor.py --run-dir run --watch      # bars, stats, ascii loss chart
+python monitor.py --run-dir run --watch      # bars, stats, loss chart
 python monitor.py --save                     # same three buttons, as flags
 ```
+
+Talk to a checkpoint from a terminal, no server, no Kaggle:
+
+```bash
+python chat.py                               # numbered list, pick one
+```
+
+`chat.py` detects whether the checkpoint is instruction-tuned and behaves
+accordingly: an `sft` model gets real turn tokens and answers, a base model
+continues your text. `/model` switches checkpoints mid-session, `/probs` shows
+per-token probabilities, `/temp` and `/topk` tune sampling.
+
+### Charts
+
+`monitor.py` draws braille charts when
+[termplot](https://github.com/evanwang810/termplot) is importable and falls back
+to ASCII otherwise. It is a soft dependency on purpose, and the import checks for
+the API rather than the name, because an unrelated package called `termplot`
+exists on PyPI and installing that one would otherwise break the monitor. To get
+it on Kaggle, set `TERMPLOT_REPO=https://github.com/evanwang810/termplot` before
+`kaggle_run.sh` and a failed install is tolerated.
+
+### Samples
+
+Every checkpoint generates from a fixed prompt and logs the result to
+`samples.txt`, alongside the loss at that step. Watching `Once upon a time`
+turn from noise into word salad into sentences tells you things a loss curve
+does not. `--sample-prompt` to change it, `--sample-tokens 0` to switch it off.
 
 CPU only, so it never touches your GPU quota. On Kaggle `--share` is mandatory:
 there is no port forwarding, so the only route to the UI is Gradio's public

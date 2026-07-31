@@ -25,6 +25,17 @@ from pathlib import Path
 
 from runstate import RunDir
 
+# Optional: braille charts when evanwang810/termplot is importable, plain ASCII
+# otherwise. There is an unrelated package of the same name on PyPI, so check for
+# the API we need rather than trusting the name.
+try:
+    import termplot as tp
+
+    if not hasattr(tp, "Figure"):
+        tp = None
+except Exception:
+    tp = None
+
 C = {
     "reset": "\x1b[0m", "dim": "\x1b[2m", "bold": "\x1b[1m",
     "red": "\x1b[31m", "green": "\x1b[32m", "yellow": "\x1b[33m",
@@ -40,10 +51,20 @@ def fmt_hms(seconds: float) -> str:
     return f"{h}h{m:02d}m{s:02d}s"
 
 
-def bar(frac: float, width: int = 46) -> str:
+BLOCKS = " ▏▎▍▌▋▊▉█"
+
+
+def bar(frac: float, width: int = 46, ascii_only: bool = False) -> str:
+    """Sub-cell resolution via partial block glyphs, so short runs still move."""
     frac = max(0.0, min(1.0, frac))
-    filled = int(round(frac * width))
-    return "#" * filled + "-" * (width - filled)
+    if ascii_only:
+        filled = int(round(frac * width))
+        return "#" * filled + "-" * (width - filled)
+    exact = frac * width
+    full = int(exact)
+    remainder = exact - full
+    partial = BLOCKS[int(remainder * 8)] if full < width else ""
+    return ("█" * full + partial).ljust(width, "░")
 
 
 def ascii_plot(series: dict[str, tuple[list, list]], width: int = 72, height: int = 16) -> list[str]:
@@ -117,15 +138,19 @@ def render(rs: RunDir, last: int, width: int, c: dict) -> str:
 
         elapsed, remaining = st.get("elapsed_s", 0.0), st.get("remaining_s", 0.0)
         total = elapsed + remaining
-        out.append(f"  session  [{bar(elapsed / total if total else 1.0)}] "
-                   f"{fmt_hms(elapsed)} / {fmt_hms(total)}")
+        ascii_only = c["reset"] == ""
+        pct = (elapsed / total if total else 1.0)
+        out.append(f"  session  {bar(pct, ascii_only=ascii_only)} "
+                   f"{pct * 100:5.1f}%  {fmt_hms(elapsed)} / {fmt_hms(total)}")
         if st.get("max_steps"):
-            out.append(f"  steps    [{bar(st['step'] / st['max_steps'])}] "
-                       f"{st['step']:,} / {st['max_steps']:,}")
+            f = st["step"] / st["max_steps"]
+            out.append(f"  steps    {bar(f, ascii_only=ascii_only)} "
+                       f"{f * 100:5.1f}%  {st['step']:,} / {st['max_steps']:,}")
         if st.get("decay_start") is not None:
             done = max(0, st["step"] - st["decay_start"])
-            out.append(f"  lr decay [{bar(done / max(1, st.get('decay_steps', 1)))}] "
-                       f"{done:,} / {st.get('decay_steps', 0):,} steps")
+            f = done / max(1, st.get("decay_steps", 1))
+            out.append(f"  lr decay {bar(f, ascii_only=ascii_only)} "
+                       f"{f * 100:5.1f}%  {done:,} / {st.get('decay_steps', 0):,} steps")
         out.append("")
 
         loss = st.get("loss_ema") or st.get("loss")
@@ -173,9 +198,29 @@ def render(rs: RunDir, last: int, width: int, c: dict) -> str:
         }
         series = {k: v for k, v in series.items() if v[0]}
         span = "whole run" if last <= 0 else f"last {last:,} steps"
-        out.append(f"  {c['cyan']}cross entropy{c['reset']} {c['dim']}({span}) "
-                   f". raw   o ema   V val{c['reset']}")
-        out.extend(ascii_plot(series, width=width))
+
+        if tp is not None and series:
+            fig = tp.Figure(width=width + 10, height=16, title=f"cross entropy ({span})",
+                            xlabel="step", grid=True, palette="ocean",
+                            color=not c["reset"] == "")
+            for label in ("loss", "ema", "val"):
+                if label in series:
+                    xs, ys, _ = series[label]
+                    fig.line(xs, ys, label={"loss": "train", "ema": "train (ema)",
+                                            "val": "val"}[label])
+            out.append(fig.render())
+        else:
+            out.append(f"  {c['cyan']}cross entropy{c['reset']} {c['dim']}({span}) "
+                       f". raw   o ema   V val{c['reset']}")
+            out.extend(ascii_plot(series, width=width))
+
+    if st and st.get("sample"):
+        out.append("")
+        out.append(f"  {c['cyan']}sample{c['reset']} {c['dim']}"
+                   f"\"{st.get('sample_prompt', '')}\" ...{c['reset']}")
+        text = st["sample"]
+        for i in range(0, min(len(text), 320), width):
+            out.append(f"    {text[i:i + width]}")
 
     return "\n".join(out)
 

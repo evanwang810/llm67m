@@ -84,11 +84,11 @@ Then **Save Version -> Save & Run All**. Both cells run in order, unattended.
 **Do you have to sit there?** No. Nothing depends on your browser. Check in
 whenever, or not at all.
 
-### Path B: watch it happen (press the run arrow)
+### Path B: interactive (not recommended)
 
-Only worth it if you want to chat with a half-trained checkpoint while it cooks.
-You must leave the tab open and the machine awake for the full nine hours, and a
-long sleep or a dropped connection can still cost you the run.
+Leaves the run at the mercy of your browser staying connected for nine hours.
+Only worth it to chat with a half-trained checkpoint mid-run, and even that is
+now covered by the sample line every checkpoint prints. Kept for reference.
 
 **Cell 1**, starts pretraining in the background so the next cell can run:
 
@@ -122,6 +122,29 @@ stat cards and a refreshing loss curve until it finishes.
 ```
 
 Run the cells with the arrow, leave the tab open. No Save Version needed.
+
+### A second session, continuing from the first
+
+Attach the finished notebook's output (**+ Add Input -> Notebook Output ->**
+`llm67m-run`), then use this as cell 1 instead. Point `RESUME_FROM` at the
+`ckpt_step*.pt` in it, and `TOKENS_DIR` at the tokens you already made, so
+neither is redone:
+
+```python
+!rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
+!MONITOR=1 \
+ RESUME_FROM=/kaggle/input/llm67m-run/run/ckpt_step0010125.pt \
+ TOKENS_DIR=/kaggle/input/llm67m-run/tokens \
+ bash /kaggle/working/code/kaggle_run.sh 9
+```
+
+Change the step number to whatever the file is actually called, check it in the
+file browser on the right. A wrong path fails immediately with a clear message
+rather than quietly starting from scratch.
+
+It picks up at the exact step with optimizer moments and loss scale intact, so
+the loss curve continues rather than spiking. Keep `--preset` the same as the
+first session or it will refuse to load.
 
 ### About the number
 
