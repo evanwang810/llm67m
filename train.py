@@ -29,8 +29,10 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -184,7 +186,12 @@ def make_synthetic_corpus(data_dir: Path, vocab_size: int = 50257, train_tokens:
 def setup_distributed():
     if "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend)
+        # NCCL's default 10 minute watchdog assumes every rank reaches each
+        # collective promptly. Rank 0 also writes checkpoints, and Kaggle's
+        # working disk is slow enough that a save can outlast that, at which
+        # point rank 1 aborts mid-run. Saves are async now, but keep a wide
+        # margin so a slow disk degrades throughput instead of killing the job.
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=60))
         rank = dist.get_rank()
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         world = dist.get_world_size()
@@ -228,8 +235,11 @@ def sample_text(raw_model, device, prompt: str, max_new: int,
                 break
         if was_training:
             raw_model.train()
-        out = enc.decode(idx[0].tolist())
-        return " ".join(out.split())
+        out = " ".join(enc.decode(idx[0].tolist()).split())
+        # BPE can emit byte sequences that are not valid text, and an untrained
+        # model emits plenty of them. Scrub anything that will not round-trip
+        # through utf-8, otherwise printing the sample raises and kills the run.
+        return out.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
     except Exception as exc:  # tokenizer missing, OOM, anything
         return f"<sampling failed: {type(exc).__name__}: {exc}>"
 
@@ -258,6 +268,43 @@ def phase_of(step: int, args: argparse.Namespace, decay_start: int | None) -> st
 # --------------------------------------------------------------------------- #
 
 
+_save_thread: threading.Thread | None = None
+
+
+def _write_payload(run_dir: Path, payload: dict, light: dict | None, step: int,
+                   milestone: bool, keep: int, keep_weights: int) -> None:
+    """The slow part: runs on a worker thread so training does not stall on it."""
+    final = run_dir / f"ckpt_step{step:07d}.pt"
+    tmp = final.with_suffix(".pt.tmp")
+    torch.save(payload, tmp)
+    os.replace(tmp, final)  # atomic: a killed session never leaves a half file
+
+    if light is not None:
+        for prefix, limit in (("weights", keep_weights), ("milestone", 1 if milestone else 0)):
+            if limit <= 0:
+                continue
+            lf = run_dir / f"{prefix}_step{step:07d}.pt"
+            lt = lf.with_suffix(".pt.tmp")
+            torch.save(light, lt)
+            os.replace(lt, lf)
+
+    from runstate import atomic_write
+
+    atomic_write(run_dir / "latest.json", json.dumps({"step": step, "ckpt": final.name}))
+
+    for prefix, limit in (("ckpt", keep), ("weights", keep_weights)):
+        files = sorted(run_dir.glob(f"{prefix}_step*.pt"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[max(0, limit):]:
+            with contextlib.suppress(OSError):
+                old.unlink()
+
+
+def wait_for_save(timeout: float = 900.0) -> None:
+    if _save_thread is not None and _save_thread.is_alive():
+        _save_thread.join(timeout)
+
+
 def save_checkpoint(
     run_dir: Path,
     raw_model: GPT,
@@ -274,12 +321,32 @@ def save_checkpoint(
     loss_ema: float | None = None,
     keep_weights: int = 8,
     milestone: bool = False,
+    blocking: bool = False,
 ) -> Path:
+    """Snapshot state to CPU here, hand the disk write to a thread.
+
+    The copy costs a second or two of RAM bandwidth; the write costs minutes on
+    Kaggle's working disk. Only the copy has to happen while the other ranks
+    wait, so this is the difference between a 5 minute stall every save and a
+    couple of seconds.
+    """
+    global _save_thread
     run_dir.mkdir(parents=True, exist_ok=True)
+    wait_for_save()  # never overlap two writes
+
+    def to_cpu(obj):
+        if torch.is_tensor(obj):
+            return obj.detach().to("cpu", copy=True)
+        if isinstance(obj, dict):
+            return {k: to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(to_cpu(v) for v in obj)
+        return obj
+
     payload = {
         "step": step,
-        "model": raw_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "model": to_cpu(raw_model.state_dict()),
+        "optimizer": to_cpu(optimizer.state_dict()),
         "scaler": scaler.state_dict(),
         "decay_start": decay_start,
         "tokens_seen": tokens_seen,
@@ -290,39 +357,27 @@ def save_checkpoint(
         "saved_at": time.time(),
         "torch_version": torch.__version__,
     }
-    final = run_dir / f"ckpt_step{step:07d}.pt"
-    tmp = final.with_suffix(".pt.tmp")
-    torch.save(payload, tmp)
-    os.replace(tmp, final)  # atomic: a killed session never leaves a half file
-
-    if eval_copy:
+    # weights_* rolls over, milestone_* is kept forever so you can put an early
+    # checkpoint and a late one against the same prompt afterwards.
+    light = None
+    if eval_copy and (keep_weights > 0 or milestone):
         light = {
             "step": step,
-            "model": {k: v.half() if v.is_floating_point() else v
+            "model": {k: v.detach().to("cpu", copy=True).half() if v.is_floating_point()
+                      else v.detach().to("cpu", copy=True)
                       for k, v in raw_model.state_dict().items()},
             "config": {"model": raw_model.cfg.as_dict()},
             "data_fingerprint": data_fingerprint,
         }
-        # weights_* rolls over, milestone_* is kept forever so you can put an
-        # early checkpoint and a late one against the same prompt afterwards.
-        prefixes = ["weights"] + (["milestone"] if milestone else [])
-        for prefix in prefixes:
-            lf = run_dir / f"{prefix}_step{step:07d}.pt"
-            lt = lf.with_suffix(".pt.tmp")
-            torch.save(light, lt)
-            os.replace(lt, lf)
 
-    from runstate import atomic_write
-
-    atomic_write(run_dir / "latest.json", json.dumps({"step": step, "ckpt": final.name}))
-
-    for prefix, limit in (("ckpt", keep), ("weights", keep_weights)):
-        files = sorted(run_dir.glob(f"{prefix}_step*.pt"),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in files[limit:]:
-            with contextlib.suppress(OSError):
-                old.unlink()
-    return final
+    args_tuple = (run_dir, payload, light, step, milestone, keep, keep_weights)
+    if blocking:
+        _write_payload(*args_tuple)
+    else:
+        _save_thread = threading.Thread(target=_write_payload, args=args_tuple,
+                                        name="checkpoint-writer", daemon=False)
+        _save_thread.start()
+    return run_dir / f"ckpt_step{step:07d}.pt"
 
 
 def pick_resume_checkpoint(args: argparse.Namespace) -> dict | None:
@@ -677,13 +732,19 @@ def main() -> None:
                                     tokens_seen, args, fingerprint, best_val,
                                     not args.no_eval_copy, args.keep_checkpoints, loss_ema,
                                     args.keep_weights, is_milestone)
-                print(f"saved {p.name} ({p.stat().st_size / 1e6:.0f} MB)"
+                print(f"saving {p.name} in the background"
                       + ("  [milestone kept]" if is_milestone else ""), flush=True)
                 if args.sample_tokens > 0:
                     last_sample = sample_text(raw_model, device, args.sample_prompt,
                                               args.sample_tokens)
-                    print(f'  sample @ {step}: "{last_sample}"', flush=True)
-                    with open(run_dir / "samples.txt", "a", encoding="utf-8") as f:
+                    # Windows consoles default to cp1252, so re-encode for stdout
+                    # specifically. Sampling must never be able to end a run.
+                    shown = last_sample.encode(sys.stdout.encoding or "utf-8",
+                                               errors="replace").decode(
+                        sys.stdout.encoding or "utf-8", errors="replace")
+                    print(f'  sample @ {step}: "{shown}"', flush=True)
+                    with open(run_dir / "samples.txt", "a", encoding="utf-8",
+                              errors="replace") as f:
                         f.write(f"step {step}\tloss {loss_ema or float('nan'):.4f}\t"
                                 f"{last_sample}\n")
             last_save = time.time()
@@ -699,7 +760,8 @@ def main() -> None:
         p = save_checkpoint(run_dir, raw_model, optimizer, scaler, step, decay_start, tokens_seen,
                             args, fingerprint, best_val, not args.no_eval_copy,
                             max(args.keep_checkpoints, 2), loss_ema,
-                            args.keep_weights, True)  # the final state is always a milestone
+                            args.keep_weights, True,  # the final state is always a milestone
+                            blocking=True)            # and must be on disk before we exit
         rs.write_status({
             "step": step, "tokens_seen": tokens_seen, "loss": loss_ema, "loss_ema": loss_ema,
             "val_loss": val_loss, "best_val": best_val,

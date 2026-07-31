@@ -20,21 +20,31 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import sys
 import time
 from pathlib import Path
 
 from runstate import RunDir
 
-# Optional: braille charts when evanwang810/termplot is importable, plain ASCII
-# otherwise. There is an unrelated package of the same name on PyPI, so check for
-# the API we need rather than trusting the name.
+# Braille charts via termplot. A real install wins; otherwise fall back to the
+# copy in vendor/ so Kaggle needs no network install. There is an unrelated
+# package of the same name on PyPI, so check for the API rather than the name,
+# and drop to plain ASCII if neither works.
 try:
     import termplot as tp
 
     if not hasattr(tp, "Figure"):
-        tp = None
+        raise ImportError("wrong termplot")
 except Exception:
-    tp = None
+    sys.path.insert(0, str(Path(__file__).parent / "vendor"))
+    try:
+        import termplot as tp
+
+        if not hasattr(tp, "Figure"):
+            tp = None
+    except Exception:
+        tp = None
 
 C = {
     "reset": "\x1b[0m", "dim": "\x1b[2m", "bold": "\x1b[1m",
@@ -42,6 +52,28 @@ C = {
     "blue": "\x1b[34m", "cyan": "\x1b[36m",
 }
 NO_COLOR = {k: "" for k in C}
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _dump_log(args, c: dict) -> None:
+    log = Path(args.run_dir) / "train.log"
+    if not log.exists():
+        return
+    n = args.tail_on_death
+    tail = log.read_text(errors="replace").splitlines()[-n:]
+    print(f"{c['dim']}--- last {n} lines of train.log ---{c['reset']}")
+    print("\n".join(tail))
 
 
 def fmt_hms(seconds: float) -> str:
@@ -112,7 +144,7 @@ def ascii_plot(series: dict[str, tuple[list, list]], width: int = 72, height: in
     return lines
 
 
-def render(rs: RunDir, last: int, width: int, c: dict) -> str:
+def render(rs: RunDir, last: int, width: int, c: dict, height: int = 22) -> str:
     st = rs.read_status()
     rows = rs.read_csv()
     out: list[str] = []
@@ -200,7 +232,7 @@ def render(rs: RunDir, last: int, width: int, c: dict) -> str:
         span = "whole run" if last <= 0 else f"last {last:,} steps"
 
         if tp is not None and series:
-            fig = tp.Figure(width=width + 10, height=16, title=f"cross entropy ({span})",
+            fig = tp.Figure(width=width, height=height, title=f"cross entropy ({span})",
                             xlabel="step", grid=True, palette="ocean",
                             color=not c["reset"] == "")
             for label in ("loss", "ema", "val"):
@@ -236,8 +268,11 @@ def main() -> None:
                    help="with --watch, exit when training finishes or stops sending a heartbeat")
     p.add_argument("--stale-minutes", type=float, default=15.0,
                    help="--until-done treats a heartbeat older than this as a dead trainer")
+    p.add_argument("--pid", type=int, default=0,
+                   help="watch this process instead of guessing from the heartbeat")
     p.add_argument("--last", type=int, default=0, help="chart only the last N steps, 0 is all")
-    p.add_argument("--width", type=int, default=72, help="chart width in columns")
+    p.add_argument("--width", type=int, default=98, help="chart width in columns")
+    p.add_argument("--height", type=int, default=22, help="chart height in rows")
     p.add_argument("--clear", action="store_true", help="redraw in place (terminals, not notebooks)")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--tail", type=int, default=0, help="print the last N train.log lines and exit")
@@ -268,7 +303,7 @@ def main() -> None:
     shown = 0
     started = time.time()
     while True:
-        text = render(rs, args.last, args.width, c)
+        text = render(rs, args.last, args.width, c, args.height)
         if args.clear:
             print("\x1b[2J\x1b[H", end="")
         print(text, flush=True)
@@ -282,18 +317,30 @@ def main() -> None:
                 print(f"\n{c['green']}training finished: {st['stop_reason']}, "
                       f"final checkpoint {st.get('final_checkpoint')}{c['reset']}")
                 return
+            # If we were given the trainer's pid, that is the authority. A stale
+            # heartbeat only means rank 0 is busy (a long save, a restart in
+            # progress); killing the cell there would abort a run that the
+            # restart loop was about to rescue.
+            if args.pid:
+                if _pid_alive(args.pid):
+                    print(f"\n{c['dim']}refreshing in {args.interval:.0f}s, "
+                          f"ctrl-c to stop{c['reset']}\n", flush=True)
+                    try:
+                        time.sleep(args.interval)
+                    except KeyboardInterrupt:
+                        return
+                    continue
+                print(f"\n{c['red']}trainer process {args.pid} is gone{c['reset']}")
+                _dump_log(args, c)
+                raise SystemExit(1)
+
             # Only trust a stale heartbeat once the trainer has had time to write one.
             grace = max(args.stale_minutes * 60, 600)
             stale = time.time() - (st or {}).get("heartbeat", 0)
             if time.time() - started > grace and stale > args.stale_minutes * 60:
                 print(f"\n{c['red']}no heartbeat for {fmt_hms(stale)}, treating the trainer as "
                       f"dead{c['reset']}")
-                log = Path(args.run_dir) / "train.log"
-                if log.exists():
-                    n = args.tail_on_death
-                    tail = log.read_text(errors="replace").splitlines()[-n:]
-                    print(f"{c['dim']}--- last {n} lines of train.log ---{c['reset']}")
-                    print("\n".join(tail))
+                _dump_log(args, c)
                 raise SystemExit(1)
 
         print(f"\n{c['dim']}refreshing in {args.interval:.0f}s, ctrl-c to stop{c['reset']}\n",

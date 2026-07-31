@@ -79,8 +79,8 @@ TRAIN_CMD=("${LAUNCH[@]}" train.py
   --deadline-hours "$TRAIN_HOURS"
   --session-start "$START_TS"
   --auto-decay --decay-steps "$DECAY_STEPS"
-  --keep-checkpoints 1 --keep-weights 2
-  --save-every-min "${SAVE_EVERY_MIN:-15}"
+  --keep-checkpoints 1 --keep-weights "${KEEP_WEIGHTS:-0}"
+  --save-every-min "${SAVE_EVERY_MIN:-25}"
   --milestone-every-min "$MILESTONE_MIN")
 
 # Continuing a previous session: point at the ckpt_step*.pt from its output.
@@ -142,10 +142,11 @@ if [ "${MONITOR:-0}" = "1" ]; then
   train_with_restarts > "$RUN/train.log" 2>&1 &
   TRAIN_PID=$!
   trap 'kill $TRAIN_PID 2>/dev/null || true' EXIT
-  # --stale-minutes has to exceed a restart gap, or the monitor would call a
-  # recovering run dead and end the notebook out from under it.
-  exec python monitor.py --run-dir "$RUN" --watch \
-    --interval "${MONITOR_INTERVAL:-300}" --until-done --stale-minutes 25 --no-color
+  # Watch the pid, not the heartbeat. A long save or a restart leaves the
+  # heartbeat stale while the run is perfectly healthy, and ending the cell
+  # there would abort a run the restart loop was about to rescue.
+  exec python monitor.py --run-dir "$RUN" --watch --pid "$TRAIN_PID" \
+    --interval "${MONITOR_INTERVAL:-300}" --until-done --no-color
 fi
 
 train_with_restarts
