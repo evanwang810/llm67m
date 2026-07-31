@@ -440,6 +440,8 @@ def build_app(run_dir: str, refresh_s: float):
                                    label="checkpoint", scale=4)
                 b_scan = gr.Button("rescan", scale=1)
                 b_load = gr.Button("load", variant="primary", scale=1)
+            dropped = gr.File(label="or drag a .pt model file here", file_types=[".pt"],
+                              type="filepath", height=110)
             ckpt_path = gr.Textbox(
                 label="or point at a file directly (overrides the dropdown)",
                 placeholder=r"C:\path\to\milestone_step0004180.pt", lines=1)
@@ -462,6 +464,11 @@ def build_app(run_dir: str, refresh_s: float):
             b_scan.click(lambda d: gr.update(choices=checkpoint_choices(Path(d))),
                          [run_dir_box], ckpt)
             b_load.click(load_checkpoint, [ckpt, ckpt_path], load_msg)
+            # Dropping a file fills the override box, then loads it. Everything
+            # downstream already prefers the override, including the chat tab,
+            # which shares the same one-model cache.
+            dropped.upload(lambda f: f or "", [dropped], ckpt_path).then(
+                load_checkpoint, [ckpt, ckpt_path], load_msg)
             b_gen.click(generate_with_override,
                         [ckpt, ckpt_path, prompt, max_tok, temp, topk, greedy], [out, probs])
 

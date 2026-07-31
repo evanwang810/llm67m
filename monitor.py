@@ -196,6 +196,8 @@ def main() -> None:
     p.add_argument("--clear", action="store_true", help="redraw in place (terminals, not notebooks)")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--tail", type=int, default=0, help="print the last N train.log lines and exit")
+    p.add_argument("--tail-on-death", type=int, default=250,
+                   help="log lines to dump when --until-done decides the trainer died")
     p.add_argument("--save", action="store_true", help="ask the trainer to checkpoint now")
     p.add_argument("--decay", action="store_true", help="ask the trainer to start lr decay")
     p.add_argument("--stop", action="store_true", help="ask the trainer to save and exit")
@@ -243,8 +245,9 @@ def main() -> None:
                       f"dead{c['reset']}")
                 log = Path(args.run_dir) / "train.log"
                 if log.exists():
-                    tail = log.read_text(errors="replace").splitlines()[-40:]
-                    print(f"{c['dim']}--- last 40 lines of train.log ---{c['reset']}")
+                    n = args.tail_on_death
+                    tail = log.read_text(errors="replace").splitlines()[-n:]
+                    print(f"{c['dim']}--- last {n} lines of train.log ---{c['reset']}")
                     print("\n".join(tail))
                 raise SystemExit(1)
 
