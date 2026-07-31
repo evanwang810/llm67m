@@ -124,6 +124,11 @@ def find_checkpoints(search_dirs) -> list[dict]:
                 m = _CKPT_RE.search(p.name)
                 if not m:
                     continue
+                # A partial download can leave a *directory* named like a
+                # checkpoint. Listing it would only produce a confusing
+                # PermissionError later, when something tries to open it.
+                if not p.is_file() or p.stat().st_size == 0:
+                    continue
                 found[p.resolve()] = {
                     "path": p,
                     "step": int(m.group(2)),

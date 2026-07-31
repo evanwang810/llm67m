@@ -7,6 +7,7 @@ every block is exactly 12*n_embd^2 + 2*n_embd parameters.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -194,6 +195,18 @@ def strip_prefixes(state: dict) -> dict:
 
 
 def load_model_from_checkpoint(path, device="cpu", override_block_size: int | None = None) -> GPT:
+    path = Path(path)
+    if path.is_dir():
+        raise SystemExit(
+            f"{path} is a directory, not a checkpoint file.\n"
+            "An interrupted download often leaves a folder named like the file. "
+            "Delete it and download the .pt again.")
+    if not path.exists():
+        raise SystemExit(f"no such checkpoint: {path}")
+    if path.stat().st_size < 1024:
+        raise SystemExit(
+            f"{path} is only {path.stat().st_size} bytes, so the download did not finish. "
+            "Delete it and try again.")
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     cfg_dict = dict(ckpt["config"]["model"] if "model" in ckpt.get("config", {}) else ckpt["config"])
     if override_block_size:
