@@ -136,7 +136,7 @@ TRAIN_CMD=("${LAUNCH[@]}" train.py
   --session-start "$START_TS"
   --auto-decay --decay-steps "$DECAY_STEPS"
   --keep-checkpoints 1 --keep-weights "${KEEP_WEIGHTS:-0}"
-  --save-every-min "${SAVE_EVERY_MIN:-25}"
+  --save-every-min "${SAVE_EVERY_MIN:-12}"
   --milestone-every-min "$MILESTONE_MIN")
 
 # Continuing a previous session: point at the ckpt_step*.pt from its output.

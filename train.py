@@ -186,12 +186,15 @@ def make_synthetic_corpus(data_dir: Path, vocab_size: int = 50257, train_tokens:
 def setup_distributed():
     if "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1:
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        # NCCL's default 10 minute watchdog assumes every rank reaches each
-        # collective promptly. Rank 0 also writes checkpoints, and Kaggle's
-        # working disk is slow enough that a save can outlast that, at which
-        # point rank 1 aborts mid-run. Saves are async now, but keep a wide
-        # margin so a slow disk degrades throughput instead of killing the job.
-        dist.init_process_group(backend=backend, timeout=timedelta(minutes=60))
+        # This timeout is a recovery-speed knob, not a safety margin. When a
+        # rank stops reaching collectives, every other rank waits this long
+        # before the watchdog fires, and only then can the restart loop resume
+        # from the last checkpoint. Set at 60 minutes it turned each hang into
+        # a full hour of dead time. Saves are asynchronous now, so the longest
+        # legitimate pause is a couple of seconds of CPU snapshot, and a short
+        # timeout costs nothing while making a hang cheap to recover from.
+        minutes = float(os.environ.get("NCCL_TIMEOUT_MIN", "15"))
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=minutes))
         rank = dist.get_rank()
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         world = dist.get_world_size()
@@ -711,6 +714,7 @@ def main() -> None:
                     "last_save_step": saved_at_step,
                     "last_save_ago_s": round(time.time() - last_save, 1),
                     "sample_prompt": args.sample_prompt, "sample": last_sample,
+                    "saving": _save_thread is not None and _save_thread.is_alive(),
                     "run_dir": str(run_dir), "pid": os.getpid(), "alive": True,
                 })
 

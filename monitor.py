@@ -159,9 +159,15 @@ def render(rs: RunDir, last: int, width: int, c: dict, height: int = 22) -> str:
         if st.get("stop_reason"):
             state, col = f"finished ({st['stop_reason']})", c["blue"]
         elif st.get("alive") and stale < 180:
-            state, col = "training", c["green"]
+            state = "training" + (" (checkpointing)" if st.get("saving") else "")
+            col = c["green"]
+        elif st.get("alive"):
+            # Not necessarily dead. Rank 0 goes quiet while it snapshots state,
+            # and a restart takes a minute or two to get going again.
+            state = f"quiet for {fmt_hms(stale)}, probably saving or restarting"
+            col = c["yellow"]
         else:
-            state, col = f"no heartbeat for {fmt_hms(stale)}", c["red"]
+            state, col = f"stopped, last update {fmt_hms(stale)} ago", c["red"]
         out.append(f"{c['bold']}llm67m{c['reset']}  {col}{state}{c['reset']}"
                    f"{c['dim']}  {st.get('non_embedding_params', 0) / 1e6:.1f}M non-emb"
                    f" | {st.get('world_size', 1)} gpu"
