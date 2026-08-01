@@ -113,22 +113,64 @@ PY
 )
 EOF
 
-# Fall back to a single process if this box does not actually have two GPUs.
-NGPU="$(python -c 'import torch; print(torch.cuda.device_count())')"
-if [ "$NGPU" -ge 2 ]; then
-  LAUNCH=(torchrun --nproc_per_node="$NGPU")
-else
-  echo "WARNING: found $NGPU gpu(s), not 2. Check the Accelerator setting is GPU T4 x2."
-  LAUNCH=(python)
+NGPU="$(python -c 'import torch; print(torch.cuda.device_count())' 2>/dev/null || echo 0)"
+DEVICE="${DEVICE:-auto}"
+if [ "$DEVICE" = "auto" ]; then
+  if [ "$NGPU" -ge 1 ]; then
+    DEVICE=gpu
+  elif python -c 'import torch_xla' >/dev/null 2>&1; then
+    DEVICE=tpu
+  else
+    DEVICE=gpu
+  fi
 fi
 
-echo "=== training ${TRAIN_HOURS}h on ${NGPU} gpu, decay ${DECAY_STEPS} steps, "\
+if [ "$DEVICE" = "tpu" ]; then
+  TRAIN_SCRIPT=train_tpu.py
+  LAUNCH=(python)   # train_tpu.py spawns its own replicas, there is no torchrun
+  # Eight cores instead of two, so the same tokens per step needs less
+  # accumulation. Keeping grad_accum at 8 would give a 500k token batch, which
+  # is larger than a 100M model wants.
+  MICRO_BATCH="${MICRO_BATCH:-8}"
+  GRAD_ACCUM="${GRAD_ACCUM:-4}"
+
+  # Kaggle caps TPU sessions at 9 hours, not the 12 you get on GPU.
+  if python -c "import sys; sys.exit(0 if $HOURS > 9 else 1)"; then
+    echo "WARNING: ${HOURS}h exceeds Kaggle's 9 hour TPU session cap. The session will be" >&2
+    echo "         killed before the deadline and the final checkpoint will be the last" >&2
+    echo "         periodic one. Use 8.5 or less." >&2
+  fi
+
+  if [ "${PREFLIGHT:-1}" = "1" ]; then
+    echo "=== TPU preflight: proving the device works before spending the session ==="
+    if ! python tpu_preflight.py --preset "$PRESET" --run-dir "$RUN" \
+        --micro-batch "$MICRO_BATCH" --grad-accum "$GRAD_ACCUM" \
+        --min-tok-s "${MIN_TOK_S:-80000}"; then
+      echo "" >&2
+      echo "=== preflight failed, refusing to start training ===" >&2
+      echo "Nothing has been spent except the preflight. Fix what it reported, or set" >&2
+      echo "DEVICE=gpu to fall back to the T4 path. PREFLIGHT=0 skips this check, which" >&2
+      echo "is only sensible if you already know why it failed." >&2
+      exit 3
+    fi
+  fi
+else
+  TRAIN_SCRIPT=train.py
+  if [ "$NGPU" -ge 2 ]; then
+    LAUNCH=(torchrun --nproc_per_node="$NGPU")
+  else
+    echo "WARNING: found $NGPU gpu(s), not 2. Check the Accelerator setting is GPU T4 x2."
+    LAUNCH=(python)
+  fi
+fi
+
+echo "=== training ${TRAIN_HOURS}h on ${DEVICE}, decay ${DECAY_STEPS} steps, "\
 "milestone every ${MILESTONE_MIN} min ==="
 
 START_TS="$(date +%s)"
 DEADLINE_SECONDS="$(python -c "print(int($TRAIN_HOURS * 3600))")"
 
-TRAIN_CMD=("${LAUNCH[@]}" train.py
+TRAIN_CMD=("${LAUNCH[@]}" "$TRAIN_SCRIPT"
   --preset "$PRESET"
   --data-dir "$TOKENS"
   --run-dir "$RUN"
@@ -138,6 +180,9 @@ TRAIN_CMD=("${LAUNCH[@]}" train.py
   --keep-checkpoints 1 --keep-weights "${KEEP_WEIGHTS:-0}"
   --save-every-min "${SAVE_EVERY_MIN:-12}"
   --milestone-every-min "$MILESTONE_MIN")
+
+if [ -n "${MICRO_BATCH:-}" ]; then TRAIN_CMD+=(--micro-batch "$MICRO_BATCH"); fi
+if [ -n "${GRAD_ACCUM:-}" ]; then TRAIN_CMD+=(--grad-accum "$GRAD_ACCUM"); fi
 
 # Anything you want to pass straight through to train.py, for shapes that are
 # not a preset: TRAIN_EXTRA="--n-layer 16 --n-embd 768 --n-head 12".
