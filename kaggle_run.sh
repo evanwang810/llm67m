@@ -139,6 +139,13 @@ TRAIN_CMD=("${LAUNCH[@]}" train.py
   --save-every-min "${SAVE_EVERY_MIN:-12}"
   --milestone-every-min "$MILESTONE_MIN")
 
+# Anything you want to pass straight through to train.py, for shapes that are
+# not a preset: TRAIN_EXTRA="--n-layer 16 --n-embd 768 --n-head 12".
+if [ -n "${TRAIN_EXTRA:-}" ]; then
+  # shellcheck disable=SC2206
+  TRAIN_CMD+=(${TRAIN_EXTRA})
+fi
+
 # Continuing a previous session: point at the ckpt_step*.pt from its output.
 # Without this, resume still works by globbing /kaggle/input, but being explicit
 # means a wrong path fails loudly instead of silently starting from scratch.
