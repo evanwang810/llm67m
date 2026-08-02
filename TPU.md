@@ -13,11 +13,20 @@ the notebook sidebar.
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!cd /kaggle/working/code && DEVICE=tpu MONITOR=1 SFT_HOURS=0.8 bash kaggle_run.sh 8.5 67m 2.5e9
+!cd /kaggle/working/code && DEVICE=tpu MONITOR=1 SFT_HOURS=0.8 bash kaggle_run.sh 8.5 tpu1session 3.8e9
 ```
 
 `8.5`, not 11. **Kaggle caps TPU sessions at 9 hours**, where GPU gets 12. The
 script warns if you ask for more, but it cannot extend the cap.
+
+`tpu1session`, not `67m`. The whole point of the TPU is that it moves the
+compute budget, and the best model for a budget scales with its square root. One
+8.5 hour v3-8 session is about 3.9e18 FLOPs, where the optimum is near 173M total
+parameters on 3.5B tokens, so the preset is 19 layers at GPT-2 small's width and
+takes roughly 6.2 of the 8.5 hours. Running `67m` here would finish in about
+three hours and leave half the session unspent on a model the T4s could have
+reached anyway. Running the T4 preset on a TPU is the most common way to get a
+TPU that is fast and pointless.
 
 `DEVICE=tpu` is optional. With no setting the script picks GPU if it sees a CUDA
 device and TPU otherwise, so on a TPU notebook it does the right thing on its

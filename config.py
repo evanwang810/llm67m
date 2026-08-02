@@ -47,6 +47,11 @@ PRESETS: dict[str, dict] = {
     "125m": {"n_layer": 12, "n_head": 12, "n_embd": 768},
     # 65.44M non-embedding, if you want to be strictly under 67M.
     "65m": {"n_layer": 11, "n_head": 11, "n_embd": 704},
+    # 134.51M non-embedding, 173.14M total. Sized for ONE 8.5 hour TPU v3-8
+    # session: at roughly 126 effective TFLOP/s that budget is 3.9e18 FLOPs, and
+    # the Chinchilla-optimal model there is about 179M total on 3.5B tokens.
+    # GPT-2 small's width made deeper, so head_dim stays at 64.
+    "tpu1session": {"n_layer": 19, "n_head": 12, "n_embd": 768},
 }
 PRESETS["gpt2-small"] = PRESETS["125m"]
 
