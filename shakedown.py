@@ -29,6 +29,7 @@ a bundle showing four failures is more useful than four separate runs.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -41,6 +42,49 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BAR = "=" * 72
+
+# This process must never initialise the XLA runtime. A TPU is claimed by one
+# process at a time, so a single call to xr.global_runtime_device_count() here
+# takes the device and every stage that spawns a trainer then dies with
+# "Check failed: reporting_closure_ == nullptr", which reads like a bug in the
+# trainer and is not. All XLA facts are gathered in throwaway subprocesses that
+# claim the device, answer, and exit. These pops are belt and braces for
+# anything that imports torch_xla despite that.
+for _var in ("TPU_PROCESS_ADDRESSES", "CLOUD_TPU_TASK_ID"):
+    os.environ.pop(_var, None)
+
+_XLA_PROBE = r"""
+import json, os
+for v in ("TPU_PROCESS_ADDRESSES", "CLOUD_TPU_TASK_ID"):
+    os.environ.pop(v, None)
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+out = {}
+try:
+    import torch_xla
+    from torch_xla import runtime as xr
+    out["torch_xla"] = torch_xla.__version__
+    out["xla_device_type"] = xr.device_type()
+    out["xla_devices"] = xr.global_runtime_device_count()
+except Exception as e:
+    out["xla_error"] = f"{type(e).__name__}: {e}"
+print("XLAPROBE" + json.dumps(out))
+"""
+
+
+def probe_xla() -> dict:
+    """Ask a subprocess about the TPU so this process never holds it."""
+    try:
+        r = subprocess.run([sys.executable, "-c", _XLA_PROBE], capture_output=True,
+                           text=True, timeout=180)
+    except Exception as e:
+        return {"xla_error": f"{type(e).__name__}: {e}"}
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("XLAPROBE"):
+            return json.loads(line[len("XLAPROBE"):])
+    # Deliberately not keyed "error": these facts get merged into the environment
+    # stage's record, and colliding with its own error field makes the summary
+    # print PASS next to an exception.
+    return {"xla_error": "probe produced no result", "stderr": (r.stderr or "")[-400:]}
 
 
 class Bundle:
@@ -73,15 +117,31 @@ class Bundle:
         except OSError as e:
             self.say(f"  could not start: {e}")
             return 127, str(e)
-        deadline = time.time() + timeout
-        for line in p.stdout:
-            lines.append(line.rstrip("\n"))
-            self.say("  " + line.rstrip("\n"))
-            if time.time() > deadline:
+        # A timer, not a check inside the read loop. A process that hangs with no
+        # output never yields another line, so an in-loop deadline never fires and
+        # the shakedown would sit there until the session died, which is the exact
+        # failure it exists to catch quickly.
+        import threading
+
+        killed = threading.Event()
+
+        def reap():
+            killed.set()
+            with contextlib.suppress(Exception):
                 p.kill()
-                self.say(f"  TIMEOUT after {timeout:.0f}s")
-                break
-        p.wait()
+
+        timer = threading.Timer(timeout, reap)
+        timer.start()
+        try:
+            for line in p.stdout:
+                lines.append(line.rstrip("\n"))
+                self.say("  " + line.rstrip("\n"))
+            p.wait()
+        finally:
+            timer.cancel()
+        if killed.is_set():
+            self.say(f"  TIMEOUT: killed after {timeout:.0f}s with no exit")
+            return 124, "\n".join(lines)
         return p.returncode, "\n".join(lines)
 
 
@@ -110,18 +170,14 @@ def stage(b: Bundle, name: str, proves: str):
     return wrap
 
 
-def detect_device() -> str:
+def detect_device(xla: dict) -> str:
     try:
         import torch
         if torch.cuda.device_count() > 0:
             return "gpu"
     except Exception:
         pass
-    try:
-        import torch_xla  # noqa: F401
-        return "tpu"
-    except Exception:
-        return "cpu"
+    return "tpu" if xla.get("xla_device_type") == "TPU" else "cpu"
 
 
 def main() -> int:
@@ -153,7 +209,8 @@ def main() -> int:
     tokens_dir = Path(args.tokens_dir) if args.tokens_dir else work / "tokens"
     run_dir = work / "run"
 
-    device = detect_device()
+    xla = probe_xla()
+    device = detect_device(xla)
     preset = args.preset or {"tpu": "tpu1session", "gpu": "67m"}.get(device, "1session")
     trainer = "train_tpu.py" if device == "tpu" else "train.py"
     tuner = "finetune_tpu.py" if device == "tpu" else "finetune.py"
@@ -177,14 +234,7 @@ def main() -> int:
             "torch": torch.__version__,
             "cuda_devices": torch.cuda.device_count(),
         }
-        try:
-            import torch_xla
-            from torch_xla import runtime as xr
-            facts["torch_xla"] = torch_xla.__version__
-            facts["xla_device_type"] = xr.device_type()
-            facts["xla_devices"] = xr.global_runtime_device_count()
-        except Exception as e:
-            facts["torch_xla"] = f"unavailable ({type(e).__name__})"
+        facts.update(xla)  # gathered by a subprocess, see probe_xla
         if torch.cuda.device_count():
             facts["gpu_names"] = [torch.cuda.get_device_name(i)
                                   for i in range(torch.cuda.device_count())]
