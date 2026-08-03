@@ -65,6 +65,54 @@ Since checkpoints are interchangeable between the two trainers, the queue is
 worth hedging against rather than waiting on: start a GPU commit as well, and
 take whichever lands first.
 
+## Shake it down first
+
+Before committing 8.5 hours, spend fifteen minutes in an **interactive** session
+running the whole pipeline small:
+
+```python
+!rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
+!python /kaggle/working/code/shakedown.py
+```
+
+This is not the preflight. `tpu_preflight.py` answers one question in ten
+minutes using synthetic tensors: is this device worth a session. The shakedown
+answers a different one: does the entire pipeline work here, end to end, on the
+real hardware, through the real data path. It really tokenizes FineWeb-Edu,
+really builds the corpus, really trains the preset you are about to use, really
+saves a checkpoint, really resumes from it, really fine-tunes, and really loads
+the result into a chat session.
+
+Nine stages, each printing what it proves:
+
+| stage | proves |
+|---|---|
+| environment | the box is what you think it is |
+| dependencies | the packages a real run installs are importable |
+| tokenize | network, HuggingFace streaming and the shard writer work |
+| dataloader | batches have the right shape and repeat for the same step |
+| model | the preset really is the size `config.py` claims |
+| train | the real trainer runs the real preset on the real device |
+| **resume** | **a restart continues the run instead of starting over** |
+| finetune | instruction tuning writes an sft checkpoint |
+| chat | the checkpoint loads back and generates text |
+
+The resume stage is the one worth the wait. Kaggle sessions die, and the whole
+design assumes a restart picks up from the last checkpoint with no loss
+discontinuity. That property is invisible in a short run and expensive to
+discover is broken in a long one, so it is tested directly: train, stop, resume,
+then run `check_resume.py` over the boundary and report the loss either side.
+
+A failing stage does not stop the ones after it. A bundle showing four problems
+is worth more than four separate runs finding one each.
+
+It writes **`/kaggle/working/shakedown.zip`** containing the full log, a JSON
+summary of every stage, and the `loss.csv`, `status.json` and `samples.txt` a
+real run would produce. Download it from the file browser on the right.
+
+It works on GPU too, picking `67m` and `train.py` instead. Useful for confirming
+a change did not break the T4 path before spending a session on it.
+
 ## The preflight
 
 Before it trains anything, the run spends about ten minutes proving the TPU
