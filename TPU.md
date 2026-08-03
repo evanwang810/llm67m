@@ -13,8 +13,14 @@ the notebook sidebar.
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
-!cd /kaggle/working/code && DEVICE=tpu MONITOR=1 SFT_HOURS=0.8 bash kaggle_run.sh 8.5 tpu1session 3.8e9
+!DEVICE=tpu MONITOR=1 SFT_HOURS=0.8 bash /kaggle/working/code/kaggle_run.sh 8.5 tpu1session 3.8e9
 ```
+
+Note the **absolute path** to `kaggle_run.sh`. Each `!` line runs in
+`/kaggle/working`, not in the cloned repo, so a bare `bash kaggle_run.sh` fails
+with `No such file or directory` before anything starts. The script works out
+where it lives and changes into that directory itself, so there is no need to
+`cd` first and no reason to chain the two with `&&`.
 
 `8.5`, not 11. **Kaggle caps TPU sessions at 9 hours**, where GPU gets 12. The
 script warns if you ask for more, but it cannot extend the cap.

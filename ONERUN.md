@@ -119,7 +119,7 @@ stat cards and a refreshing loss curve until it finishes.
 **Cell 3**, instruction tuning, after cell 2 says training finished:
 
 ```python
-!cd /kaggle/working/code && python finetune.py --run-dir /kaggle/working/run --hours 0.4
+!python /kaggle/working/code/finetune.py --run-dir /kaggle/working/run --hours 0.4
 ```
 
 Run the cells with the arrow, leave the tab open. No Save Version needed.
