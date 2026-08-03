@@ -71,6 +71,22 @@ def pick_checkpoint(search_dirs) -> Path | None:
         print("not a valid choice")
 
 
+def _emit(piece: str) -> None:
+    """Stream a token to stdout without letting the console kill the reply.
+
+    A Windows console defaults to cp1252, which cannot represent most of what
+    BPE can decode to, and an undertrained model emits plenty of it. Writing it
+    raw raises UnicodeEncodeError mid-generation and loses the whole reply, so
+    anything the terminal cannot encode is replaced rather than fatal.
+    """
+    enc = sys.stdout.encoding or "utf-8"
+    try:
+        sys.stdout.write(piece)
+    except UnicodeEncodeError:
+        sys.stdout.write(piece.encode(enc, errors="replace").decode(enc, errors="replace"))
+    sys.stdout.flush()
+
+
 class Session:
     def __init__(self, path: Path, device: str) -> None:
         print(f"{C['dim']}loading {path.name}...{C['reset']}", flush=True)
@@ -133,8 +149,7 @@ class Session:
                 break
             piece = self.enc.decode([nxt])
             out_parts.append(piece)
-            sys.stdout.write(piece)
-            sys.stdout.flush()
+            _emit(piece)
             if show_probs:
                 top_p, top_i = probs_full.topk(5)
                 rows.append((piece, float(probs_full[nxt]),

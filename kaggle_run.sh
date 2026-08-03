@@ -271,6 +271,10 @@ fi
 # Fine-tuning as part of the same command, so it cannot run off a stale
 # checkpoint when training never happened. Unset SFT_HOURS to skip it.
 if [ -n "${SFT_HOURS:-}" ]; then
-  echo "=== instruction tuning for ${SFT_HOURS}h ==="
-  exec python finetune.py --run-dir "$RUN" --hours "$SFT_HOURS"
+  # finetune.py picks cuda-or-cpu, and a TPU VM has no CUDA, so on that path it
+  # would silently tune on the host and never finish.
+  SFT_SCRIPT=finetune.py
+  if [ "$DEVICE" = "tpu" ]; then SFT_SCRIPT=finetune_tpu.py; fi
+  echo "=== instruction tuning for ${SFT_HOURS}h (${SFT_SCRIPT}) ==="
+  exec python "$SFT_SCRIPT" --run-dir "$RUN" --hours "$SFT_HOURS"
 fi

@@ -138,6 +138,29 @@ the others never reach is a hang with no watchdog to end it.
 by one token per pass, so on device it would compile a fresh graph per token. On
 the CPU it costs under a second and the log keeps its samples.
 
+## Fine-tuning
+
+Handled by the same command. `SFT_HOURS=0.8` chains into `finetune_tpu.py`
+instead of `finetune.py` when `DEVICE=tpu`, which matters because `finetune.py`
+picks cuda-or-cpu and a TPU VM has no CUDA: left alone it would quietly tune on
+the host and never finish inside the session.
+
+Fine-tuning is a friendlier XLA target than pretraining. `build_dataset` already
+pads every example to `max_len` and the batch size never varies, so the step
+graph is static without anything having to change for it.
+
+One thing did have to change, and it is not obvious. `finetune.py` walks a
+single shuffled cursor, which is right for one device and wrong for eight: every
+replica would draw the identical batch, the all-reduce would average eight
+copies of the same gradient, and the run would spend eight times the compute to
+make one device's progress. The loss curve would look completely normal while it
+happened. Each replica now takes its own stripe of the same permutation, so the
+eight of them cover `batch_size * world` distinct examples per micro step with
+no overlap and no communication.
+
+Budget roughly 10 minutes rather than the 50 the T4s need, so `SFT_HOURS=0.8` is
+generous. It stops early when the data runs out.
+
 ## Checkpoints are interchangeable
 
 A checkpoint written by the TPU trainer resumes in the CUDA trainer and the
