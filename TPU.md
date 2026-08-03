@@ -33,6 +33,32 @@ device and TPU otherwise, so on a TPU notebook it does the right thing on its
 own. Set it explicitly when you want the run to fail loudly rather than silently
 train on the wrong accelerator.
 
+## The queue
+
+Kaggle has far fewer TPUs than people who want them, and it has been that way
+for a long time. Queues in the dozens and waits of one to two hours are normal,
+not an outage. Committed runs queue longer than interactive ones because they
+ask for a guaranteed multi-hour slot.
+
+**Waiting costs nothing.** Quota is counted against execution time, not queue
+time, so a commit that sits pending overnight has spent none of your 20 weekly
+hours. Leave it queued; it will run when capacity frees.
+
+Telling a queue apart from a hang takes one look at the log. Queued means
+*zero* output, no banner at all. Once the container starts, the very first thing
+printed is:
+
+```
+=== TPU preflight: proving the device works before spending the session ===
+```
+
+If you can see that line, you have a TPU and the code is running. If you cannot,
+you are still waiting for hardware and nothing in this repo has executed yet.
+
+Since checkpoints are interchangeable between the two trainers, the queue is
+worth hedging against rather than waiting on: start a GPU commit as well, and
+take whichever lands first.
+
 ## The preflight
 
 Before it trains anything, the run spends about ten minutes proving the TPU
