@@ -119,6 +119,30 @@ class GPT(nn.Module):
             if name.endswith("attn.proj.weight") or name.endswith("mlp.proj.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
+    def _apply(self, *args, **kwargs):
+        """Restore weight tying after anything that rebuilds the parameters.
+
+        nn.Module._apply can only update a parameter in place when the result is
+        shallow-copy compatible with the original. A move to a different device
+        type is not, so it constructs a fresh Parameter for each entry in each
+        module's dict, and a Parameter shared by two modules comes back as two
+        independent tensors.
+
+        On CUDA this never surfaced. On XLA it does: .to(xla_device) silently
+        untied wte from lm_head, giving 211.78M parameters where the preset says
+        173.14M, an extra embedding's worth of optimizer state, and two copies
+        that then train apart. The quiet part is the checkpoint, because
+        load_resume drops lm_head.weight whenever the config says tied, so
+        resuming one of those would have thrown away the learned output head and
+        kept training as if nothing happened.
+
+        Retying here rather than at each call site means a move cannot undo it.
+        """
+        out = super()._apply(*args, **kwargs)
+        if self.cfg.tie_embeddings and self.lm_head.weight is not self.wte.weight:
+            self.lm_head.weight = self.wte.weight
+        return out
+
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
         if isinstance(module, nn.Linear):

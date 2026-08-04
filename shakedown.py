@@ -213,6 +213,19 @@ def main() -> int:
                                   for i in range(torch.cuda.device_count())]
         du = shutil.disk_usage("/kaggle/working" if Path("/kaggle/working").exists() else ".")
         facts["disk_free_gb"] = round(du.free / 1e9, 1)
+        # Eight replicas each hold a full copy of the model, so host RAM is the
+        # binding constraint on a TPU box, not device memory. A worker killed by
+        # the OOM killer surfaces as BrokenProcessPool with no Python traceback,
+        # which is unreadable unless you already know what the budget was.
+        try:
+            meminfo = dict(
+                (k.strip(), int(v.split()[0]))
+                for k, v in (l.split(":", 1) for l in
+                             Path("/proc/meminfo").read_text().splitlines()))
+            facts["ram_total_gb"] = round(meminfo["MemTotal"] / 1e6, 1)
+            facts["ram_available_gb"] = round(meminfo["MemAvailable"] / 1e6, 1)
+        except Exception:
+            pass
         for k, v in facts.items():
             b.say(f"  {k:18} {v}")
         if facts["disk_free_gb"] < 5:
@@ -303,7 +316,7 @@ def main() -> int:
               "--micro-batch", str(args.micro_batch), "--grad-accum", str(args.grad_accum),
               "--block-size", str(args.block_size),
               "--log-every", "5", "--eval-every", "0", "--warmup-steps", "10",
-              "--save-every-min", "0.05", "--deadline-hours", "0.5"]
+              "--save-every-min", "0.4", "--deadline-hours", "0.5"]
 
     @stage(b, "train", "the real trainer runs the real preset on the real device")
     def _train():

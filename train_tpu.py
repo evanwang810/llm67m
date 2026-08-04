@@ -72,6 +72,9 @@ class NullScaler:
         return 1.0
 
 
+_HOST_MODEL: GPT | None = None  # reused by _sample_on_host
+
+
 def autocast_bf16():
     try:
         return torch.autocast("xla", dtype=torch.bfloat16)
@@ -159,6 +162,19 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     with torch.no_grad():
         X.all_reduce_sum(list(model.parameters()), scale=1.0 / world)
     X.sync()
+
+    # A cross-device move used to untie wte from lm_head, which cost an extra
+    # embedding of weights, gradients and Adam moments per replica and, worse,
+    # produced checkpoints whose output head is discarded on resume. GPT._apply
+    # reties now; this refuses to run if that ever stops working, because the
+    # symptom is a model that trains perfectly well and is quietly the wrong one.
+    live = sum(p.numel() for p in model.parameters())
+    want = non_embedding_params(cfg) + cfg.vocab_size * cfg.n_embd * (1 if cfg.tie_embeddings else 2)
+    if live != want:
+        raise SystemExit(
+            f"model has {live:,} parameters on device, expected {want:,}. "
+            f"Weight tying did not survive the move to {dev}."
+        )
 
     optimizer = model.configure_optimizer(args.lr, args.weight_decay, (0.9, 0.95), "xla")
     if resume_optimizer is not None:
@@ -405,8 +421,14 @@ def _sample_on_host(model, cfg, args) -> str:
     parameters to the host costs a fraction of a second and this only runs at
     checkpoints.
     """
+    global _HOST_MODEL
     try:
-        host = GPT(cfg)
+        # Built once and refilled. A fresh GPT per checkpoint means allocating
+        # another 173M fp32 parameters, ~700MB, on a box that is already holding
+        # eight replicas and a multi-gigabyte checkpoint snapshot.
+        if _HOST_MODEL is None:
+            _HOST_MODEL = GPT(cfg)
+        host = _HOST_MODEL
         host.load_state_dict({k: v.detach().float().cpu()
                               for k, v in model.state_dict().items()}, strict=False)
         host.eval()
