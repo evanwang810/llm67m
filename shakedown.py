@@ -53,38 +53,11 @@ BAR = "=" * 72
 for _var in ("TPU_PROCESS_ADDRESSES", "CLOUD_TPU_TASK_ID"):
     os.environ.pop(_var, None)
 
-_XLA_PROBE = r"""
-import json, os
-for v in ("TPU_PROCESS_ADDRESSES", "CLOUD_TPU_TASK_ID"):
-    os.environ.pop(v, None)
-os.environ.setdefault("PJRT_DEVICE", "TPU")
-out = {}
-try:
-    import torch_xla
-    from torch_xla import runtime as xr
-    out["torch_xla"] = torch_xla.__version__
-    out["xla_device_type"] = xr.device_type()
-    out["xla_devices"] = xr.global_runtime_device_count()
-except Exception as e:
-    out["xla_error"] = f"{type(e).__name__}: {e}"
-print("XLAPROBE" + json.dumps(out))
-"""
-
-
 def probe_xla() -> dict:
-    """Ask a subprocess about the TPU so this process never holds it."""
-    try:
-        r = subprocess.run([sys.executable, "-c", _XLA_PROBE], capture_output=True,
-                           text=True, timeout=180)
-    except Exception as e:
-        return {"xla_error": f"{type(e).__name__}: {e}"}
-    for line in (r.stdout or "").splitlines():
-        if line.startswith("XLAPROBE"):
-            return json.loads(line[len("XLAPROBE"):])
-    # Deliberately not keyed "error": these facts get merged into the environment
-    # stage's record, and colliding with its own error field makes the summary
-    # print PASS next to an exception.
-    return {"xla_error": "probe produced no result", "stderr": (r.stderr or "")[-400:]}
+    """Version and device facts, gathered without holding the device here."""
+    from xla_probe import probe
+
+    return probe(cwd=str(HERE))
 
 
 class Bundle:

@@ -80,15 +80,11 @@ def autocast_bf16():
 
 
 def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
-    import torch_xla.core.xla_model as xm
+    import xla_compat as X
 
-    dev = xm.xla_device()
-    ordinal = xm.get_ordinal()
-    try:
-        world = xm.xrt_world_size()
-    except AttributeError:
-        from torch_xla import runtime as xr
-        world = xr.world_size()
+    dev = X.device()
+    ordinal = X.ordinal()
+    world = X.world_size()
     master = ordinal == 0
 
     def say(msg):
@@ -110,7 +106,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
 
     if args.smoke_test and master:
         cuda.make_synthetic_corpus(Path(args.data_dir))
-    xm.rendezvous("corpus-ready")
+    X.rendezvous("corpus-ready")
 
     train_corpus = Corpus(args.data_dir, args.block_size, "train")
     try:
@@ -161,8 +157,8 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     # the mean is a no-op numerically, but it is one cheap collective against a
     # failure that looks exactly like normal training.
     with torch.no_grad():
-        xm.all_reduce(xm.REDUCE_SUM, list(model.parameters()), scale=1.0 / world)
-    xm.mark_step()
+        X.all_reduce_sum(list(model.parameters()), scale=1.0 / world)
+    X.sync()
 
     optimizer = model.configure_optimizer(args.lr, args.weight_decay, (0.9, 0.95), "xla")
     if resume_optimizer is not None:
@@ -223,7 +219,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                 total = total + loss.detach().float()
                 n += 1
         model.train()
-        avg = xm.all_reduce(xm.REDUCE_SUM, total / max(1, n), scale=1.0 / world)
+        avg = X.mean(total / max(1, n))
         return float(avg.cpu())
 
     model.train()
@@ -259,7 +255,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             if args.auto_decay and decay_start is None and secs_per_step > 0:
                 if deadline - time.time() <= args.decay_steps * secs_per_step * 1.05:
                     local |= 1 << 1
-            flags = xm.mesh_reduce("ctl", local, lambda vs: int(np.bitwise_or.reduce(vs)))
+            flags = X.mesh_reduce("ctl", local, lambda vs: int(np.bitwise_or.reduce(vs)))
             force_save = bool(flags & 1) or bool(flags & 8)
             want_decay = bool(flags & 2)
             want_stop = bool(flags & 4)
@@ -295,14 +291,14 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
         if args.grad_clip > 0:
             # Stays a device tensor. float() here would sync every step.
             grad_norm_t = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        xm.optimizer_step(optimizer)  # all-reduce + step + graph execution
+        X.optimizer_step(optimizer)  # all-reduce + step + graph execution
 
         step += 1
         tokens_seen += tokens_per_step
 
         # ---- logging ----
         if step % args.log_every == 0 or force_save:
-            lossf = xm.all_reduce(xm.REDUCE_SUM, loss_sum / args.grad_accum, scale=1.0 / world)
+            lossf = X.mean(loss_sum / args.grad_accum)
             lossf = float(lossf.cpu())
             grad_norm = float(grad_norm_t.cpu()) if args.grad_clip > 0 else 0.0
             loss_ema = lossf if loss_ema is None else 0.9 * loss_ema + 0.1 * lossf
@@ -355,7 +351,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
         # ---- periodic save ----
         if force_save:
             if master:
-                xm.mark_step()
+                X.sync()
                 p = cuda.save_checkpoint(run_dir, model, optimizer, scaler, step, decay_start,
                                          tokens_seen, args, fingerprint, best_val,
                                          not args.no_eval_copy, args.keep_checkpoints, loss_ema,
@@ -373,12 +369,12 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             if is_milestone:
                 last_milestone = last_save
             saved_at_step = step
-            xm.rendezvous("saved")
+            X.rendezvous("saved")
 
     # ---- final save ----
     if master:
         print(f"stopping: {stop_reason}. writing final checkpoint", flush=True)
-        xm.mark_step()
+        X.sync()
         p = cuda.save_checkpoint(run_dir, model, optimizer, scaler, step, decay_start,
                                  tokens_seen, args, fingerprint, best_val,
                                  not args.no_eval_copy, max(args.keep_checkpoints, 2),
@@ -398,7 +394,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             "non_embedding_params": non_embedding_params(cfg),
         })
         print(f"final: {p}  step={step}  tokens={tokens_seen / 1e9:.3f}B", flush=True)
-    xm.rendezvous("done")
+    X.rendezvous("done")
 
 
 def _sample_on_host(model, cfg, args) -> str:

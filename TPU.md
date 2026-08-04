@@ -232,6 +232,20 @@ trainer produced it.
 | gate 4, recompilation | the step graph is not static. Report the number; it means something in the loop changes shape |
 | gate 4, throughput | something is falling back to the host |
 | gate 5, checkpoint mismatch | stop. The run would produce checkpoints you cannot trust |
+| `AttributeError: module 'torch_xla.core.xla_model' has no attribute ...` | the API moved again. Every name is resolved in one place, `xla_compat.py`; add the new spelling there rather than at the call site |
+
+## A note on torch_xla versions
+
+Kaggle's TPU image moved from PT/XLA 2.1 to 2.8 without announcement, and 2.7
+**removed** `xm.get_ordinal` and `xm.xrt_world_size` rather than deprecating
+them, so code written against the older spelling dies on the first line of the
+spawned function. Guessing a version and hardcoding its names failed twice, so
+all of it now resolves through `xla_compat.py`, newest name first, older name as
+a fallback. Anything unresolvable raises at import with the full list of what was
+tried, rather than at replica zero four minutes into a run, one name at a time.
+
+`tpu_preflight.py` prints which spellings it resolved, so the log says what API
+it actually found.
 
 Falling back costs one command: `DEVICE=gpu` on a GPU notebook, and the T4 path
 runs exactly as before.

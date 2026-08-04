@@ -57,15 +57,11 @@ def autocast_bf16():
 
 
 def _mp_fn(index, args):  # noqa: ARG001
-    import torch_xla.core.xla_model as xm
+    import xla_compat as X
 
-    dev = xm.xla_device()
-    ordinal = xm.get_ordinal()
-    try:
-        world = xm.xrt_world_size()
-    except AttributeError:
-        from torch_xla import runtime as xr
-        world = xr.world_size()
+    dev = X.device()
+    ordinal = X.ordinal()
+    world = X.world_size()
     master = ordinal == 0
 
     def say(msg):
@@ -93,8 +89,8 @@ def _mp_fn(index, args):  # noqa: ARG001
     # construction, and eight slightly different models still produce a falling
     # loss curve.
     with torch.no_grad():
-        xm.all_reduce(xm.REDUCE_SUM, list(model.parameters()), scale=1.0 / world)
-    xm.mark_step()
+        X.all_reduce_sum(list(model.parameters()), scale=1.0 / world)
+    X.sync()
 
     optimizer = model.configure_optimizer(args.lr, args.weight_decay, (0.9, 0.95), "xla")
 
@@ -158,7 +154,7 @@ def _mp_fn(index, args):  # noqa: ARG001
             (loss / args.grad_accum).backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        xm.optimizer_step(optimizer)
+        X.optimizer_step(optimizer)
 
         # Reading the loss forces the queued graph to run and the host to wait,
         # so it happens on log boundaries only. The deadline goes through the
@@ -166,7 +162,7 @@ def _mp_fn(index, args):  # noqa: ARG001
         # agree on which step to break at, and one leaving the loop early strands
         # the other seven at a collective that never completes.
         if (step + 1) % args.log_every == 0:
-            avg = xm.all_reduce(xm.REDUCE_SUM, total / args.grad_accum, scale=1.0 / world)
+            avg = X.mean(total / args.grad_accum)
             lossf = float(avg.cpu())
             loss_ema = lossf if loss_ema is None else 0.9 * loss_ema + 0.1 * lossf
             left = max(0.0, deadline - time.time())
@@ -177,7 +173,7 @@ def _mp_fn(index, args):  # noqa: ARG001
                 rs.append_csv({"step": base_step + step + 1, "loss": f"{lossf:.5f}",
                                "loss_ema": f"{loss_ema:.5f}", "lr": f"{lr:.6e}",
                                "phase": "sft"})
-            out_of_time = xm.mesh_reduce(
+            out_of_time = X.mesh_reduce(
                 "sft-stop", int(master and time.time() > deadline), max)
             if out_of_time:
                 say(f"hit the {args.hours}h limit at step {step + 1}")
@@ -185,7 +181,7 @@ def _mp_fn(index, args):  # noqa: ARG001
                 break
 
     if master:
-        xm.mark_step()
+        X.sync()
         out = Path(args.run_dir) / f"sft_step{base_step:07d}.pt"
         payload = {
             "step": base_step,
@@ -204,7 +200,7 @@ def _mp_fn(index, args):  # noqa: ARG001
         torch.save(payload, tmp)
         os.replace(tmp, out)
         print(f"\nsaved {out}  ({out.stat().st_size / 1e6:.0f} MB)", flush=True)
-    xm.rendezvous("sft-done")
+    X.rendezvous("sft-done")
 
 
 def main() -> None:

@@ -14,7 +14,7 @@ The gates, in order:
   2  arithmetic on device gives the right answer      (seconds)
   3  all replicas start and can all_reduce            (a minute)
   4  the real model trains at a real speed            (a few minutes)
-  5  a checkpoint round trips through xm.save         (a minute)
+  5  a checkpoint round trips through a save and load (a minute)
 
 Gate 4 is the one that matters. A TPU that is present, passes every
 correctness check and still trains at 9k tokens/sec is the expensive failure
@@ -70,61 +70,36 @@ def fail(gate: str, why: str, fix: str = "") -> None:
 # --------------------------------------------------------------------------- #
 
 
-def gate_1_import():
+def gate_1_probe():
+    """Version and device count, from a subprocess.
+
+    Reading this in-process would initialise the XLA runtime and claim the TPU,
+    and xmp.spawn below forks from this very process. It would then find the
+    device already held and abort inside the runtime with an error that looks
+    like a bug in the training code.
+    """
+    from xla_probe import probe
+
     t0 = time.time()
-    try:
-        import torch_xla
-        import torch_xla.core.xla_model as xm
-    except ImportError as e:
-        fail("gate 1 (import)", f"torch_xla is not importable: {e}",
+    facts = probe(cwd=str(Path(__file__).resolve().parent))
+    if facts.get("xla_error"):
+        fail("gate 1 (import)", f"torch_xla did not come up: {facts['xla_error']}",
              "The notebook accelerator is not set to TPU. Change it in the sidebar; "
              "do not pip install torch_xla, Kaggle's TPU image already has a matching build.")
+    if facts.get("xla_api_error"):
+        fail("gate 1 (import)", f"the torch_xla API did not resolve: {facts['xla_api_error']}",
+             "Add the new spelling to xla_compat.py.")
 
-    try:
-        from torch_xla import runtime as xr
-        kind = xr.device_type()
-        n = xr.global_runtime_device_count()
-    except Exception:  # torch_xla older than the runtime module
-        xr = None
-        kind = os.environ.get("PJRT_DEVICE", "?")
-        n = 0
-
-    log(f"  torch_xla {torch_xla.__version__}  device_type={kind}  devices={n}")
+    kind, n = facts.get("xla_device_type"), facts.get("xla_devices", 0)
+    log(f"  torch_xla {facts.get('torch_xla')}  device_type={kind}  devices={n}")
+    log(f"  {facts.get('xla_api', '')}")
     if kind != "TPU":
         fail("gate 1 (import)", f"torch_xla came up on {kind!r}, not TPU",
              "Set the accelerator to TPU VM v3-8 and restart the session.")
     if n and n < 8:
         log(f"  WARNING: {n} devices, expected 8 on a v3-8. Continuing.")
     log(f"  gate 1 ok ({time.time() - t0:.1f}s)")
-    return xm
-
-
-def gate_2_arithmetic(xm) -> None:
-    import torch
-
-    t0 = time.time()
-    dev = xm.xla_device()
-    a = torch.arange(1024, dtype=torch.float32, device=dev).reshape(32, 32)
-    b = (a @ a.T).sum()
-    got = float(b.cpu())
-    want = float((torch.arange(1024, dtype=torch.float64).reshape(32, 32)
-                  @ torch.arange(1024, dtype=torch.float64).reshape(32, 32).T).sum())
-    if abs(got - want) / want > 1e-4:
-        fail("gate 2 (arithmetic)", f"matmul on device gave {got:.6g}, expected {want:.6g}",
-             "The XLA backend is wired up but computing the wrong answer. Do not train on this.")
-
-    # bf16 is the whole reason a TPU is faster here. If autocast is unavailable
-    # the run still works in fp32, but at a fraction of the speed, so say so now
-    # rather than letting gate 4's throughput number look mysterious.
-    bf16 = False
-    try:
-        with torch.autocast("xla", dtype=torch.bfloat16):
-            c = a @ a.T
-        bf16 = c.dtype == torch.bfloat16
-    except Exception as e:
-        log(f"  WARNING: autocast('xla', bfloat16) unavailable ({type(e).__name__}), will train fp32")
-    log(f"  bf16 autocast: {'yes' if bf16 else 'NO (fp32 fallback)'}")
-    log(f"  gate 2 ok ({time.time() - t0:.1f}s)")
+    return facts
 
 
 # --------------------------------------------------------------------------- #
@@ -134,30 +109,42 @@ def gate_2_arithmetic(xm) -> None:
 
 def _mp_fn(index, opts: dict):
     import torch
-    import torch_xla
-    import torch_xla.core.xla_model as xm
     import torch_xla.debug.metrics as met
 
+    import xla_compat as X
     from config import PRESETS, GPTConfig
     from model import GPT
 
-    dev = xm.xla_device()
-    ordinal = xm.get_ordinal()
-    try:
-        world = xm.xrt_world_size()
-    except AttributeError:
-        from torch_xla import runtime as xr
-        world = xr.world_size()
+    dev = X.device()
+    ordinal = X.ordinal()
+    world = X.world_size()
     master = ordinal == 0
 
     def note(msg):
         if master:
             print(msg, flush=True)
 
+    # ---- gate 2: arithmetic on device is correct ----
+    t0 = time.time()
+    a = torch.arange(1024, dtype=torch.float32, device=dev).reshape(32, 32)
+    got = float((a @ a.T).sum().cpu())
+    ref = torch.arange(1024, dtype=torch.float64).reshape(32, 32)
+    want = float((ref @ ref.T).sum())
+    if abs(got - want) / want > 1e-4:
+        raise RuntimeError(f"matmul on device gave {got:.6g}, expected {want:.6g}")
+    bf16 = False
+    try:
+        with torch.autocast("xla", dtype=torch.bfloat16):
+            bf16 = (a @ a.T).dtype == torch.bfloat16
+    except Exception as e:
+        note(f"  WARNING: autocast('xla', bfloat16) unavailable ({type(e).__name__}), fp32")
+    note(f"  arithmetic correct, bf16 autocast: {'yes' if bf16 else 'NO (fp32 fallback)'}")
+    note("  gate 2 ok")
+
     # ---- gate 3: every replica is real and can talk ----
     t0 = time.time()
     probe = torch.tensor([float(ordinal)], device=dev)
-    total = xm.all_reduce(xm.REDUCE_SUM, probe)
+    total = X.all_reduce_sum(probe)
     got = float(total.cpu())
     want = world * (world - 1) / 2
     if abs(got - want) > 0.5:
@@ -192,7 +179,7 @@ def _mp_fn(index, opts: dict):
                 _, loss = model(x, y)
             (loss / ga).backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        xm.optimizer_step(opt)
+        X.optimizer_step(opt)
 
     model.train()
     warm = opts["warmup_steps"]
@@ -200,8 +187,8 @@ def _mp_fn(index, opts: dict):
     t0 = time.time()
     for i in range(warm):
         one_step(1e-3)
-    xm.mark_step()
-    xm.wait_device_ops()
+    X.sync()
+    X.wait()
     warm_s = time.time() - t0
 
     def compiles():
@@ -218,8 +205,8 @@ def _mp_fn(index, opts: dict):
     t0 = time.time()
     for i in range(meas):
         one_step(1e-3 * (1.0 - 0.5 * i / max(1, meas)))
-    xm.mark_step()
-    xm.wait_device_ops()
+    X.sync()
+    X.wait()
     dt = time.time() - t0
     after_measure = compiles()
 
@@ -233,8 +220,8 @@ def _mp_fn(index, opts: dict):
     if master:
         tmp.parent.mkdir(parents=True, exist_ok=True)
     ref = next(iter(model.state_dict().values())).detach().float().cpu().clone()
-    xm.save({"model": model.state_dict(), "step": 0}, str(tmp))
-    xm.rendezvous("saved")
+    X.save({"model": model.state_dict(), "step": 0}, str(tmp))
+    X.rendezvous("saved")
     ok_ckpt = True
     if master:
         back = torch.load(tmp, map_location="cpu", weights_only=False)
@@ -281,8 +268,7 @@ def main() -> int:
     log("TPU preflight")
     log("=" * 70)
 
-    xm = gate_1_import()
-    gate_2_arithmetic(xm)
+    gate_1_probe()
 
     out = Path(args.run_dir) / "preflight.json"
     out.parent.mkdir(parents=True, exist_ok=True)
