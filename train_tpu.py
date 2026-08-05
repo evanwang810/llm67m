@@ -82,6 +82,24 @@ def autocast_bf16():
         return contextlib.nullcontext()
 
 
+def xla_compiles() -> int:
+    """How many distinct graphs XLA has compiled so far.
+
+    The single most diagnostic number on this path. If it keeps climbing step
+    after step, the graph is not static and the run is spending its life in the
+    compiler rather than the MXU, which looks like a healthy run that is simply
+    inexplicably slow. If it plateaus and the run is still slow, the work is
+    falling back to the host instead.
+    """
+    try:
+        import torch_xla.debug.metrics as met
+
+        d = met.metric_data("CompileTime")
+        return int(d[0]) if d else -1
+    except Exception:
+        return -1
+
+
 def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     import xla_compat as X
 
@@ -195,7 +213,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
               f"{train_corpus.n_blocks:,} blocks")
         print(f"batch: {args.micro_batch} x {args.grad_accum} accum x {world} core x "
               f"{args.block_size} = {tokens_per_step:,} tokens/step")
-        print(f"device=TPU replicas={world} bf16=native")
+        print(f"device={dev} replicas={world} bf16=native compiles={xla_compiles()}")
         if info is not None:
             print(f"resumed at step {step}, tokens_seen {tokens_seen / 1e9:.3f}B, "
                   f"decay_start={decay_start}")
@@ -317,6 +335,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             lossf = X.mean(loss_sum / args.grad_accum)
             lossf = float(lossf.cpu())
             grad_norm = float(grad_norm_t.cpu()) if args.grad_clip > 0 else 0.0
+            compiles = xla_compiles()
             loss_ema = lossf if loss_ema is None else 0.9 * loss_ema + 0.1 * lossf
             now = time.time()
             dt = max(1e-6, now - last_log_t)
@@ -329,6 +348,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                 remaining = max(0.0, deadline - now)
                 print(f"step {step:>7} | loss {lossf:.4f} (ema {loss_ema:.4f}) | lr {lr:.2e} | "
                       f"{tok_per_s / 1e3:.1f}k tok/s | gn {grad_norm:.2f} | "
+                      f"compiles {compiles} | "
                       f"{tokens_seen / 1e9:.3f}B tok | {remaining / 3600:.2f}h left", flush=True)
                 rs.append_csv({
                     "step": step, "wall_s": round(now - session_start, 1), "tokens": tokens_seen,
@@ -351,7 +371,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                     "last_save_step": saved_at_step,
                     "last_save_ago_s": round(time.time() - last_save, 1),
                     "sample_prompt": args.sample_prompt, "sample": last_sample,
-                    "device": "tpu",
+                    "device": str(dev), "xla_compiles": compiles,
                     "saving": False,
                     "run_dir": str(run_dir), "pid": os.getpid(), "alive": True,
                 })

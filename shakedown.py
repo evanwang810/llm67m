@@ -160,7 +160,7 @@ def main() -> int:
     ap.add_argument("--out", default="/kaggle/working/shakedown")
     ap.add_argument("--tokens", type=float, default=3e6,
                     help="how much FineWeb-Edu to actually tokenize")
-    ap.add_argument("--steps", type=int, default=30, help="steps per training leg")
+    ap.add_argument("--steps", type=int, default=12, help="steps per training leg")
     ap.add_argument("--micro-batch", type=int, default=4)
     ap.add_argument("--grad-accum", type=int, default=2)
     ap.add_argument("--block-size", type=int, default=1024)
@@ -310,6 +310,40 @@ def main() -> int:
             raise RuntimeError("parameter count disagrees with the formula")
         return {"non_embedding_params": formula, "total_params": sum(p.numel()
                                                                     for p in m.parameters())}
+
+    # ---------------------------------------------------------- preflight
+    @stage(b, "preflight", "the device is doing the work, and compilation settles")
+    def _pre():
+        """Isolates the question the training stage cannot answer.
+
+        Fixed synthetic shapes, a controlled learning rate, and a direct read of
+        XLA's CompileTime counter. If compiles keep climbing the graph is not
+        static and the run lives in the compiler; if they plateau and it is
+        still slow the work is falling back to the host. Thresholds are wide
+        open here on purpose: the shakedown wants the numbers, not a verdict.
+        """
+        if device != "tpu":
+            b.say("  not a TPU, skipping")
+            return {"skipped": True}
+        code, _ = b.run([sys.executable, "tpu_preflight.py", "--preset", preset,
+                         "--run-dir", str(run_dir), "--micro-batch", str(args.micro_batch),
+                         "--grad-accum", str(args.grad_accum),
+                         "--block-size", str(args.block_size),
+                         "--warmup-steps", "3", "--measure-steps", "6",
+                         "--min-tok-s", "1", "--max-compiles", "100000"], timeout=2400)
+        pf = run_dir / "preflight.json"
+        if not pf.exists():
+            raise RuntimeError(f"preflight wrote no result (exit {code})")
+        r = json.loads(pf.read_text())
+        per_step = r.get("compiles_measure", -1) / max(1, 6)
+        b.say(f"  {r['tok_per_s'] / 1e3:.1f}k tok/s, {r['secs_per_step']:.2f}s/step, "
+              f"{r['compiles_measure']} compiles over 6 steps ({per_step:.1f}/step)")
+        if per_step >= 0.5:
+            b.say("  DIAGNOSIS: the step graph is not static, XLA recompiles almost every step")
+        elif r["tok_per_s"] < 42_000:
+            b.say("  DIAGNOSIS: compilation is settled but throughput is below the dual T4, "
+                  "so work is falling back to the host")
+        return r
 
     # ------------------------------------------------------- 5+6. train/resume
     common = ["--preset", preset, "--data-dir", str(tokens_dir), "--run-dir", str(run_dir),
