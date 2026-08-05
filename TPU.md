@@ -169,6 +169,28 @@ is imported, including `save_checkpoint`.
 
 Five deliberate differences:
 
+**The step is executed, every step.** This is the one that matters, and getting
+it wrong cost four runs. XLA is lazy: operations accumulate into a pending graph
+and nothing runs until something forces it. Almost every example gets the sync
+for free because `MpDeviceLoader` issues one per iteration, and this trainer
+feeds batches from its own index-based sampler instead, so nothing was issuing
+it at all.
+
+Left alone the graph never resets at the end of a step. It keeps growing, one
+more forward, backward and optimizer update each time, until something reads a
+value off the device and forces the whole accumulated thing to compile and run.
+That graph is a different size every time, so it is a fresh compilation every
+time, and compile cost climbs with graph size. What you see is a training loop
+running about a hundred times too slowly, getting worse the longer it runs, and
+eventually a worker dying with no Python traceback at all when the compiler
+gives up. Every number in the log looks fine. The loss falls. The samples
+improve. It is just a hundred times too slow, and nothing says why.
+
+`xm.optimizer_step(optimizer, barrier=True)` is the documented fix when
+`MpDeviceLoader` is not in the picture; `xla_compat.optimizer_step` passes it and
+calls `sync()` afterwards regardless. The evaluation loop syncs per batch for the
+same reason.
+
 **No GradScaler.** bf16 has fp32's exponent range, so there is nothing to
 rescale. The checkpoint still carries a null `scaler` key so the formats match.
 
@@ -233,6 +255,8 @@ trainer produced it.
 | gate 4, throughput | something is falling back to the host |
 | gate 5, checkpoint mismatch | stop. The run would produce checkpoints you cannot trust |
 | `AttributeError: module 'torch_xla.core.xla_model' has no attribute ...` | the API moved again. Every name is resolved in one place, `xla_compat.py`; add the new spelling there rather than at the call site |
+| `BrokenProcessPool`, no traceback, tens of seconds per step | the graph is not being executed per step. Check the `compiles` figure in the log: if it tracks the step count, something in the loop stopped issuing a sync |
+| `WARNING: N compilations over N steps` | the trainer noticed the same thing itself and will say so by step 40 rather than at hour eight |
 
 ## A note on torch_xla versions
 

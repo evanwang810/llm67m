@@ -103,6 +103,26 @@ fi
 
 # Reserve time for tokenizing, and derive the schedule knobs from the budget:
 # decay over roughly the last 15% of steps, and about 8 permanent milestones.
+# Tokens are uint16, so the corpus alone is two bytes each, and a 173M model
+# checkpoints at roughly 2GB with optimizer state. Kaggle gives about 21GB of
+# working disk. Running out halfway through loses the session, so say so now.
+python - "$MAX_TOKENS" "$RUN" <<'PY' || true
+import shutil, sys
+from pathlib import Path
+tokens_gb = float(sys.argv[1]) * 2 / 1e9
+root = Path(sys.argv[2])
+while not root.exists() and root.parent != root:
+    root = root.parent
+free_gb = shutil.disk_usage(root).free / 1e9
+need = tokens_gb + 8  # checkpoints, milestones, and the temp copy while writing
+print(f"disk: {free_gb:.1f}GB free, corpus needs {tokens_gb:.1f}GB, "
+      f"estimate {need:.1f}GB total")
+if need > free_gb:
+    print(f"WARNING: this may not fit. Lower the third argument below "
+          f"{(free_gb - 8) * 1e9 / 2:.1e} tokens, or expect the run to die on a "
+          f"full disk part way through.", file=sys.stderr)
+PY
+
 read -r TRAIN_HOURS DECAY_STEPS MILESTONE_MIN <<EOF
 $(python - "$HOURS" <<'PY'
 import sys

@@ -82,6 +82,30 @@ def autocast_bf16():
         return contextlib.nullcontext()
 
 
+def quantized_lr(step: int, args, decay_start: int | None, buckets: int = 32) -> float:
+    """The schedule's learning rate, snapped to a coarse grid.
+
+    Insurance, and cheap. Once the step graph is executed per step, the only
+    thing left that varies between steps is the learning rate. If XLA folds it
+    in as a constant rather than passing it as an input, every distinct value is
+    a distinct graph, and a 500 step warmup becomes 500 compilations, which is
+    longer than the session.
+
+    torch_xla generally materialises Python scalars as device data precisely so
+    that hyperparameter schedules do not do this, and HuggingFace's schedulers
+    run on TPU without trouble, so this most likely costs nothing at all. But
+    the downside if that is wrong is a whole wasted session, and the downside of
+    being wrong here is a warmup that rises in 32 steps instead of 500, which
+    does not measurably change training. The preflight reports the compile count
+    either way, so the guess does not have to stay a guess.
+    """
+    lr = cuda.lr_at(step, args, decay_start)
+    if args.lr <= 0:
+        return lr
+    grid = args.lr / buckets
+    return round(lr / grid) * grid
+
+
 def xla_compiles() -> int:
     """How many distinct graphs XLA has compiled so far.
 
@@ -236,7 +260,8 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     last_log_t = time.time()
     last_log_step = step
     secs_per_step = 0.0
-    lr = cuda.lr_at(step, args, decay_start)
+    start_step = step
+    lr = quantized_lr(step, args, decay_start)
     val_loss: float | None = None
     stop_reason = ""
 
@@ -252,6 +277,10 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                     _, loss = model(x, y)
                 total = total + loss.detach().float()
                 n += 1
+                # Same reason the training step syncs: without this the whole
+                # evaluation, forty forward passes by default, accumulates into
+                # one graph that is compiled from scratch at the end.
+                X.sync()
         model.train()
         avg = X.mean(total / max(1, n))
         return float(avg.cpu())
@@ -308,7 +337,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             break
 
         # ---- one optimizer step ----
-        lr = cuda.lr_at(step, args, decay_start)
+        lr = quantized_lr(step, args, decay_start)
         for group in optimizer.param_groups:
             group["lr"] = lr
 
@@ -336,6 +365,14 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             lossf = float(lossf.cpu())
             grad_norm = float(grad_norm_t.cpu()) if args.grad_clip > 0 else 0.0
             compiles = xla_compiles()
+            # One graph per step is the healthy shape, so the compile count
+            # should flatten within the first few dozen steps. If it is still
+            # tracking the step count the run would spend the session in the
+            # compiler, and finding that out at step 40 beats finding out at
+            # hour eight.
+            if compiles > 0 and step - start_step >= 40 and compiles > (step - start_step) * 0.5:
+                say(f"WARNING: {compiles} compilations over {step - start_step} steps. "
+                    "The step graph is not static; this run will be compiler bound.")
             loss_ema = lossf if loss_ema is None else 0.9 * loss_ema + 0.1 * lossf
             now = time.time()
             dt = max(1e-6, now - last_log_t)

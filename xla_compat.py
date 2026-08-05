@@ -61,7 +61,39 @@ device = _pick("device", (torch_xla, "device"), (_xm, "xla_device"))
 sync = _pick("sync", (torch_xla, "sync"), (_xm, "mark_step"))
 wait = _pick("wait_device_ops", (_xm, "wait_device_ops"), (torch_xla, "wait_device_ops"))
 
-optimizer_step = _pick("optimizer_step", (_xm, "optimizer_step"))
+_optimizer_step = _pick("optimizer_step", (_xm, "optimizer_step"))
+
+
+def optimizer_step(optimizer):
+    """Reduce gradients across replicas, step, and then execute the graph.
+
+    The last part is the whole point. XLA is lazy: operations accumulate into a
+    pending graph and nothing runs until something forces it. MpDeviceLoader
+    issues that sync on every iteration, which is why almost every example gets
+    it for free; this trainer feeds batches from its own index-based sampler
+    instead, so nothing was issuing it at all.
+
+    Left alone, the graph does not reset at the end of a step. It keeps growing,
+    one more forward, backward and optimizer update per step, until something
+    reads a value off the device and forces the whole accumulated thing to
+    compile and run. That graph is a different size every time, so it is a fresh
+    compilation every time, and compile cost grows with graph size. The result
+    is a training loop that runs about a hundred times too slowly, gets worse
+    the longer it runs, and eventually dies with no Python traceback when the
+    compiler gives up on a graph that never stops growing.
+
+    barrier=True is the documented way to issue the sync when MpDeviceLoader is
+    not in the picture. The fallback covers versions whose signature lacks it.
+    """
+    try:
+        out = _optimizer_step(optimizer, barrier=True)
+    except TypeError:  # a version whose signature has no barrier
+        out = _optimizer_step(optimizer)
+    # Unconditional, not an else. Whether barrier=True was accepted, and whether
+    # it still means what it meant, is not worth betting a session on; a second
+    # sync with nothing pending costs nothing.
+    sync()
+    return out
 mesh_reduce = _pick("mesh_reduce", (_xm, "mesh_reduce"))
 rendezvous = _pick("rendezvous", (_xm, "rendezvous"))
 save = _pick("save", (_xm, "save"))
