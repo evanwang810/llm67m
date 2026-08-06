@@ -39,6 +39,27 @@ device and TPU otherwise, so on a TPU notebook it does the right thing on its
 own. Set it explicitly when you want the run to fail loudly rather than silently
 train on the wrong accelerator.
 
+## Measured
+
+A full shakedown on a real v3-8, all ten stages green:
+
+| | |
+|---|---|
+| throughput | **202,000 tokens/sec** on the 173M model |
+| per step | 0.32s |
+| effective | 163 TFLOP/s, 39% of the chip's 420 peak |
+| against the dual T4 | **4.8x** |
+| compilations | 4 during warmup, then flat |
+
+The compile count is the one to watch. Flat means the step graph is static and
+XLA is executing a cached program rather than building a new one; if it tracks
+the step count instead, see the sync note below, because that is what a hundred
+fold slowdown looks like from the outside.
+
+At that rate 8 hours of training is about 5.9B tokens, so the
+Chinchilla-optimal 3.5B for this model takes under 5 hours and the session has
+room to over-train, which is the right trade for something you intend to run.
+
 ## The queue
 
 Kaggle has far fewer TPUs than people who want them, and it has been that way
