@@ -160,8 +160,14 @@ def _mp_fn(index, opts: dict):
 
     mb, ga, bs = opts["micro_batch"], opts["grad_accum"], opts["block_size"]
     tokens_per_step = mb * ga * world * bs
-    x = torch.randint(0, cfg.vocab_size, (mb, bs), device=dev)
-    y = torch.randint(0, cfg.vocab_size, (mb, bs), device=dev)
+    # One distinct pair per micro step. Reusing a single pair lets XLA's common
+    # subexpression elimination collapse the accumulation into a single forward
+    # and backward, so the measured graph is grad_accum times smaller than the
+    # real one: it overstates throughput and, worse, hides an out-of-memory that
+    # only appears once training builds the real graph.
+    batches = [(torch.randint(0, cfg.vocab_size, (mb, bs), device=dev),
+                torch.randint(0, cfg.vocab_size, (mb, bs), device=dev))
+               for _ in range(ga)]
 
     def autocast():
         try:
@@ -174,10 +180,11 @@ def _mp_fn(index, opts: dict):
         for g in opt.param_groups:
             g["lr"] = lr
         opt.zero_grad(set_to_none=True)
-        for _ in range(ga):
+        for x, y in batches:
             with autocast():
                 _, loss = model(x, y)
             (loss / ga).backward()
+            X.sync()  # matches the trainer: one micro batch per graph
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         X.optimizer_step(opt)
 

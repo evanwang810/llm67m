@@ -152,6 +152,7 @@ def _mp_fn(index, args):  # noqa: ARG001
                 _, loss = model(x, y)
             total = total + loss.detach().float()
             (loss / args.grad_accum).backward()
+            X.sync()  # peak memory is one micro batch, not grad_accum of them
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         X.optimizer_step(optimizer)

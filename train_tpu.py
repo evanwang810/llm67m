@@ -349,6 +349,14 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
                 _, loss = model(x, y)
             loss_sum = loss_sum + loss.detach().float()
             (loss / args.grad_accum).backward()
+            # Execute each micro batch on its own rather than letting the whole
+            # accumulation become one graph. Gradients live in .grad and persist
+            # across graph boundaries, so the arithmetic is identical, but peak
+            # device memory becomes one micro batch instead of grad_accum of
+            # them. Attention scores alone are batch x heads x 1024 x 1024 in
+            # fp32, 384MB per layer at micro_batch 8, and nineteen layers times
+            # four micro batches of those is what put 37GB into a 15.75GB HBM.
+            X.sync()
 
         grad_norm_t = torch.zeros((), device=dev)
         if args.grad_clip > 0:

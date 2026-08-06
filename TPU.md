@@ -212,6 +212,17 @@ improve. It is just a hundred times too slow, and nothing says why.
 calls `sync()` afterwards regardless. The evaluation loop syncs per batch for the
 same reason.
 
+**One micro batch per graph, not the whole accumulation.** A v3 core has
+15.75GB of HBM, and XLA has no flash-attention kernel so it decomposes SDPA into
+matmuls and a softmax, materialising the full attention score matrix as
+`batch x heads x 1024 x 1024` in fp32. At micro_batch 8 that is 384MB per layer.
+Nineteen layers of it, times four micro batches all live in one graph, is 36.7GB
+against a 15.75GB budget, which is what the first real run hit almost exactly.
+Syncing after each micro batch's backward changes nothing arithmetically,
+because gradients live in `.grad` and persist across graph boundaries, but peak
+memory becomes one micro batch instead of `grad_accum` of them. With
+micro_batch 4 that is about 7GB.
+
 **No GradScaler.** bf16 has fp32's exponent range, so there is nothing to
 rescale. The checkpoint still carries a null `scaler` key so the formats match.
 

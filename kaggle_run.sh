@@ -106,21 +106,33 @@ fi
 # Tokens are uint16, so the corpus alone is two bytes each, and a 173M model
 # checkpoints at roughly 2GB with optimizer state. Kaggle gives about 21GB of
 # working disk. Running out halfway through loses the session, so say so now.
-python - "$MAX_TOKENS" "$RUN" <<'PY' || true
-import shutil, sys
+python - "$MAX_TOKENS" "$RUN" "$TOKENS" <<'PY' || true
+import json, shutil, sys
 from pathlib import Path
+
 tokens_gb = float(sys.argv[1]) * 2 / 1e9
 root = Path(sys.argv[2])
 while not root.exists() and root.parent != root:
     root = root.parent
 free_gb = shutil.disk_usage(root).free / 1e9
-need = tokens_gb + 8  # checkpoints, milestones, and the temp copy while writing
-print(f"disk: {free_gb:.1f}GB free, corpus needs {tokens_gb:.1f}GB, "
-      f"estimate {need:.1f}GB total")
-if need > free_gb:
-    print(f"WARNING: this may not fit. Lower the third argument below "
-          f"{(free_gb - 8) * 1e9 / 2:.1e} tokens, or expect the run to die on a "
-          f"full disk part way through.", file=sys.stderr)
+
+# This runs after tokenization, so if the corpus is already written its bytes
+# are gone from the free figure and must not be counted a second time.
+meta = Path(sys.argv[3]) / "meta.json"
+on_disk = 0.0
+if meta.exists():
+    try:
+        on_disk = int(json.loads(meta.read_text()).get("total_tokens", 0)) * 2 / 1e9
+    except Exception:
+        pass
+
+ckpt_gb = 8  # rolling checkpoint, milestones, and the temp copy while writing
+still_needed = max(0.0, tokens_gb - on_disk) + ckpt_gb
+print(f"disk: {free_gb:.1f}GB free, corpus {on_disk:.1f}GB written of "
+      f"{tokens_gb:.1f}GB, still need about {still_needed:.1f}GB")
+if still_needed > free_gb:
+    print(f"WARNING: this may not fit. Lower the third argument, or expect the "
+          f"run to die on a full disk part way through.", file=sys.stderr)
 PY
 
 read -r TRAIN_HOURS DECAY_STEPS MILESTONE_MIN <<EOF
@@ -148,11 +160,13 @@ fi
 if [ "$DEVICE" = "tpu" ]; then
   TRAIN_SCRIPT=train_tpu.py
   LAUNCH=(python)   # train_tpu.py spawns its own replicas, there is no torchrun
-  # Eight cores instead of two, so the same tokens per step needs less
-  # accumulation. Keeping grad_accum at 8 would give a 500k token batch, which
-  # is larger than a 100M model wants.
-  MICRO_BATCH="${MICRO_BATCH:-8}"
-  GRAD_ACCUM="${GRAD_ACCUM:-4}"
+  # A v3 core has 15.75GB of HBM and attention scores are batch x heads x seq x
+  # seq in fp32, since XLA has no flash kernel and decomposes SDPA. At
+  # micro_batch 8 that is 384MB per layer, and nineteen layers of it does not
+  # fit. Four halves it, and grad_accum absorbs the difference so tokens per
+  # step is unchanged at 262,144.
+  MICRO_BATCH="${MICRO_BATCH:-4}"
+  GRAD_ACCUM="${GRAD_ACCUM:-8}"
 
   # Kaggle caps TPU sessions at 9 hours, not the 12 you get on GPU.
   if python -c "import sys; sys.exit(0 if $HOURS > 9 else 1)"; then
