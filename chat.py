@@ -19,6 +19,7 @@ Commands inside the session:
     /tokens 128       max new tokens per reply
     /greedy           toggle argmax sampling
     /probs            toggle the per-token probability table
+    /history 0        previous turns to carry, 0 suits an Alpaca-tuned model
     /stats            what this session has generated so far
     /reset            clear the conversation
     /help  /quit
@@ -62,10 +63,14 @@ class Settings:
     topk: int = 40
     greedy: bool = False
     probs: bool = False
+    # How many previous exchanges to put in front of the question. Zero for an
+    # Alpaca-tuned model on purpose: see Session.build_prompt.
+    history: int = 0
 
     def summary(self) -> str:
         mode = "greedy" if self.greedy else f"temp {self.temp:g} · top-k {self.topk}"
-        return f"{mode} · max {self.tokens} tok"
+        hist = "no history" if self.history == 0 else f"{self.history} turns of history"
+        return f"{mode} · max {self.tokens} tok · {hist}"
 
 
 @dataclass
@@ -167,24 +172,33 @@ class Session:
         ]
         return ui.panel("llm67m chat", rows)
 
-    def build_prompt(self, message: str) -> list[int]:
+    def build_prompt(self, message: str, turns: int = 0) -> list[int]:
+        """Assemble the prompt, carrying only `turns` previous exchanges.
+
+        Alpaca is single-turn data. The model has never seen one exchange
+        followed by another, so a conversation in front of the question does not
+        read as context, it reads as the pattern to continue: ask it four things
+        in a row with history on and it answers the first one four times. Zero is
+        the honest default until it is tuned on multi-turn data.
+        """
+        keep = self.history[-2 * turns:] if turns > 0 else []
         if self.sft:
             ids: list[int] = []
-            for role, content in self.history:
+            for role, content in keep:
                 ids += [self.user_token if role == "user" else self.assistant_token]
                 ids += self.enc.encode_ordinary(content)
             ids += [self.user_token] + self.enc.encode_ordinary(message)
             ids += [self.assistant_token]
             return ids
         # A base model has never seen a turn structure, so just hand it the text.
-        text = "".join(c for _, c in self.history) + message
+        text = "".join(c for _, c in keep) + message
         return self.enc.encode_ordinary(text) or [self.enc.eot_token]
 
     @torch.no_grad()
     def reply(self, message: str, max_tokens: int, temperature: float,
               top_k: int, greedy: bool, show_probs: bool,
-              stream: bool = True) -> str:
-        ids = self.build_prompt(message)[-(self.model.cfg.block_size - 1):]
+              stream: bool = True, turns: int = 0) -> str:
+        ids = self.build_prompt(message, turns)[-(self.model.cfg.block_size - 1):]
         self.last_ctx = len(ids)
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
         out_parts: list[str] = []
@@ -267,6 +281,8 @@ def settings_menu(s: Settings) -> None:
              "always take the likeliest token"),
             (f"probability table {ui.accent('on' if s.probs else 'off')}",
              "show the top 5 per token"),
+            (f"history turns    {ui.accent(str(s.history))}",
+             "0 suits a model tuned on single-turn data"),
         ])
         if idx is None:
             return
@@ -280,6 +296,8 @@ def settings_menu(s: Settings) -> None:
             s.greedy = not s.greedy
         elif idx == 4:
             s.probs = not s.probs
+        elif idx == 5:
+            s.history = max(0, ui.ask("  history turns", s.history, int))
 
 
 def show_stats(session: Session) -> None:
@@ -400,6 +418,13 @@ def main() -> None:
             elif cmd == "/probs":
                 settings.probs = not settings.probs
                 print(ui.dim(f"  probs = {settings.probs}"))
+            elif cmd == "/history":
+                try:
+                    settings.history = max(0, int(arg))
+                    print(ui.dim(f"  carrying {settings.history} previous turns"))
+                except ValueError:
+                    print(ui.bad(f"  usage: /history <n>   (currently {settings.history})"))
+                    print(ui.dim("  0 is recommended for an Alpaca-tuned model"))
             elif cmd in ("/temp", "/topk", "/tokens"):
                 key = cmd[1:]
                 try:
@@ -417,7 +442,7 @@ def main() -> None:
         print(ui.chip(label, ui.BOT_CODE_N))
         try:
             session.reply(line, settings.tokens, settings.temp, settings.topk,
-                          settings.greedy, settings.probs)
+                          settings.greedy, settings.probs, turns=settings.history)
         except KeyboardInterrupt:
             print(ui.dim("\n  stopped"))
 
