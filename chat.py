@@ -1,22 +1,25 @@
 #!/usr/bin/env python
-"""Terminal chat and completion against any checkpoint. Runs anywhere, CPU by default.
+"""Terminal chat against any checkpoint. Runs anywhere, CPU by default.
 
-    python chat.py                          # pick a model from a numbered list
+    python chat.py                          # menu: pick a model and talk to it
     python chat.py --model run/sft_step0001183.pt
     python chat.py --dir path/to/run        # search somewhere specific
 
-It works out whether the checkpoint is instruction-tuned and behaves accordingly:
-an sft model gets real <|user|> / <|assistant|> turns and answers you, a base
-model continues whatever text you type, because that is all it knows how to do.
+It works out whether the checkpoint is instruction-tuned and behaves
+accordingly: an sft model gets real <|user|> / <|assistant|> turns and answers
+you, a base model continues whatever text you type, because that is all it knows
+how to do.
 
 Commands inside the session:
 
+    /menu             settings, model switching, session stats
     /model            pick a different checkpoint
     /temp 0.8         sampling temperature
     /topk 40          top-k cutoff, 0 turns it off
     /tokens 128       max new tokens per reply
     /greedy           toggle argmax sampling
     /probs            toggle the per-token probability table
+    /stats            what this session has generated so far
     /reset            clear the conversation
     /help  /quit
 """
@@ -24,91 +27,124 @@ Commands inside the session:
 from __future__ import annotations
 
 import argparse
-import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
+import chatui as ui
 from model import load_model_from_checkpoint
 from runstate import default_search_dirs, find_checkpoints
 
 USER_TOKEN = 50257
 ASSISTANT_TOKEN = 50258
 
-C = {"dim": "\x1b[2m", "bold": "\x1b[1m", "cyan": "\x1b[36m", "green": "\x1b[32m",
-     "yellow": "\x1b[33m", "red": "\x1b[31m", "reset": "\x1b[0m"}
+KIND_LABEL = {
+    "sft": ("instruction tuned", "answers questions"),
+    "milestone": ("milestone", "permanent snapshot, base model"),
+    "full": ("full checkpoint", "includes optimizer state, base model"),
+    "weights": ("rolling weights", "base model"),
+}
 
 
 def no_color() -> None:
-    for k in C:
-        C[k] = ""
+    """Kept for callers that drive this module non-interactively."""
+    ui.off()
 
 
-def pick_checkpoint(search_dirs) -> Path | None:
+@dataclass
+class Settings:
+    tokens: int = 128
+    temp: float = 0.8
+    topk: int = 40
+    greedy: bool = False
+    probs: bool = False
+
+    def summary(self) -> str:
+        mode = "greedy" if self.greedy else f"temp {self.temp:g} · top-k {self.topk}"
+        return f"{mode} · max {self.tokens} tok"
+
+
+@dataclass
+class Stats:
+    replies: int = 0
+    tokens: int = 0
+    seconds: float = 0.0
+
+    @property
+    def rate(self) -> float:
+        return self.tokens / self.seconds if self.seconds else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# picking a checkpoint
+# --------------------------------------------------------------------------- #
+
+
+def checkpoint_menu(search_dirs) -> Path | None:
     cands = find_checkpoints(search_dirs)
     if not cands:
-        print(f"{C['red']}no checkpoints found{C['reset']} under:")
+        print(ui.bad("\nno checkpoints found") + " under:")
         for d in search_dirs:
-            print(f"  {d}")
+            print(f"  {ui.dim(str(d))}")
         print("\nPass --model with a path, or --dir with the folder holding your .pt files.")
         return None
 
-    print(f"\n{C['bold']}checkpoints found{C['reset']}")
-    for i, c in enumerate(cands, 1):
-        tag = {"sft": f"{C['green']}sft, answers questions{C['reset']}",
-               "full": "full, includes optimizer state",
-               "milestone": "milestone snapshot",
-               "weights": "rolling snapshot"}[c["kind"]]
-        print(f"  {C['cyan']}{i:>2}{C['reset']}  step {c['step']:>8,}  {c['size_mb']:>5.0f} MB  "
-              f"{tag}\n      {C['dim']}{c['path']}{C['reset']}")
-    while True:
-        raw = input(f"\npick a number (or q): ").strip()
-        if raw.lower() in ("q", "quit", ""):
-            return None
-        if raw.isdigit() and 1 <= int(raw) <= len(cands):
-            return cands[int(raw) - 1]["path"]
-        print("not a valid choice")
+    now = time.time()
+    options = []
+    for c in cands:
+        name, note = KIND_LABEL.get(c["kind"], (c["kind"], ""))
+        try:
+            age = ui.human_age(now - c["path"].stat().st_mtime)
+        except OSError:
+            age = "?"
+        tag = ui.good(name) if c["kind"] == "sft" else ui.dim(name)
+        label = f"{tag}  step {c['step']:,}"
+        options.append((label, f"{c['size_mb']:.0f} MB · {age} · {note}"))
+
+    idx = ui.choose("checkpoints found", options, allow_back=True)
+    return None if idx is None else cands[idx]["path"]
 
 
-def _emit(piece: str) -> None:
-    """Stream a token to stdout without letting the console kill the reply.
-
-    A Windows console defaults to cp1252, which cannot represent most of what
-    BPE can decode to, and an undertrained model emits plenty of it. Writing it
-    raw raises UnicodeEncodeError mid-generation and loses the whole reply, so
-    anything the terminal cannot encode is replaced rather than fatal.
-    """
-    enc = sys.stdout.encoding or "utf-8"
-    try:
-        sys.stdout.write(piece)
-    except UnicodeEncodeError:
-        sys.stdout.write(piece.encode(enc, errors="replace").decode(enc, errors="replace"))
-    sys.stdout.flush()
+# --------------------------------------------------------------------------- #
+# session
+# --------------------------------------------------------------------------- #
 
 
 class Session:
     def __init__(self, path: Path, device: str) -> None:
-        print(f"{C['dim']}loading {path.name}...{C['reset']}", flush=True)
+        print(ui.dim(f"loading {path.name} ..."), flush=True)
+        t0 = time.time()
         self.model, ckpt = load_model_from_checkpoint(path, device=device)
+        self.load_s = time.time() - t0
         self.device = torch.device(device)
         self.path = path
         self.sft = bool(ckpt.get("sft"))
         self.user_token = ckpt.get("user_token", USER_TOKEN)
         self.assistant_token = ckpt.get("assistant_token", ASSISTANT_TOKEN)
         self.step = ckpt.get("step", 0)
+        self.params = sum(p.numel() for p in self.model.parameters())
         import tiktoken
 
         self.enc = tiktoken.get_encoding("gpt2")
         self.history: list[tuple[str, str]] = []
-        n = sum(p.numel() for p in self.model.parameters())
-        mode = (f"{C['green']}instruction tuned{C['reset']}, ask it things"
-                if self.sft else
-                f"{C['yellow']}base model{C['reset']}, it continues your text rather than answering")
-        print(f"{C['bold']}{path.name}{C['reset']}  step {self.step:,}  {n / 1e6:.1f}M params  "
-              f"ctx {self.model.cfg.block_size}\n{mode}")
+        self.stats = Stats()
+        self.last_ctx = 0
 
-    def build_prompt(self, message: str) -> tuple[list[int], str]:
+    def header(self, settings: Settings) -> str:
+        kind = (ui.good("instruction tuned") if self.sft
+                else ui.warn("base model, continues your text"))
+        rows = [
+            ("model", f"{ui.bold(self.path.name)}  {kind}"),
+            ("size", f"{self.params / 1e6:.1f}M params · ctx {self.model.cfg.block_size} · "
+                     f"trained to step {self.step:,}"),
+            ("sampling", ui.dim(settings.summary())),
+        ]
+        return ui.panel("llm67m chat", rows)
+
+    def build_prompt(self, message: str) -> list[int]:
         if self.sft:
             ids: list[int] = []
             for role, content in self.history:
@@ -116,20 +152,24 @@ class Session:
                 ids += self.enc.encode_ordinary(content)
             ids += [self.user_token] + self.enc.encode_ordinary(message)
             ids += [self.assistant_token]
-            return ids, ""
+            return ids
         # A base model has never seen a turn structure, so just hand it the text.
         text = "".join(c for _, c in self.history) + message
-        return self.enc.encode_ordinary(text) or [self.enc.eot_token], text
+        return self.enc.encode_ordinary(text) or [self.enc.eot_token]
 
     @torch.no_grad()
     def reply(self, message: str, max_tokens: int, temperature: float,
-              top_k: int, greedy: bool, show_probs: bool) -> str:
-        ids, _ = self.build_prompt(message)
-        ids = ids[-(self.model.cfg.block_size - 1):]
+              top_k: int, greedy: bool, show_probs: bool,
+              stream: bool = True) -> str:
+        ids = self.build_prompt(message)[-(self.model.cfg.block_size - 1):]
+        self.last_ctx = len(ids)
         idx = torch.tensor([ids], dtype=torch.long, device=self.device)
         out_parts: list[str] = []
         rows = []
+        streamer = ui.Streamer(indent=2, code=ui.BOT_CODE) if stream else None
 
+        t0 = time.time()
+        first_token_s = None
         for _ in range(max_tokens):
             window = idx[:, -self.model.cfg.block_size:]
             logits, _ = self.model(window)
@@ -145,11 +185,14 @@ class Session:
                     scaled = scaled.masked_fill(scaled < kth, float("-inf"))
                 nxt = int(torch.multinomial(F.softmax(scaled, dim=-1), 1))
 
+            if first_token_s is None:
+                first_token_s = time.time() - t0
             if nxt == self.enc.eot_token or nxt >= self.enc.n_vocab:
                 break
             piece = self.enc.decode([nxt])
             out_parts.append(piece)
-            _emit(piece)
+            if streamer:
+                streamer.feed(piece)
             if show_probs:
                 top_p, top_i = probs_full.topk(5)
                 rows.append((piece, float(probs_full[nxt]),
@@ -157,16 +200,107 @@ class Session:
                               for p, t in zip(top_p, top_i)]))
             idx = torch.cat([idx, torch.tensor([[nxt]], device=self.device)], dim=1)
 
-        print()
-        reply = "".join(out_parts)
+        elapsed = time.time() - t0
+        if streamer:
+            streamer.done()
+        n = len(out_parts)
+        self.stats.replies += 1
+        self.stats.tokens += n
+        self.stats.seconds += elapsed
+
+        if stream:
+            rate = n / elapsed if elapsed else 0.0
+            ctx_pct = 100 * (self.last_ctx + n) / self.model.cfg.block_size
+            print(ui.faint(
+                f"  {n} tok · {elapsed:.1f}s · {rate:.1f} tok/s · "
+                f"first {first_token_s or 0:.2f}s · "
+                f"ctx {self.last_ctx + n}/{self.model.cfg.block_size} ({ctx_pct:.0f}%)"))
         if show_probs and rows:
-            print(f"\n{C['dim']}{'token':<14}{'p':>7}   top 5{C['reset']}")
+            print()
+            print(ui.dim(f"  {'token':<14}{'p':>7}   top 5"))
             for piece, p, top5 in rows[:40]:
+                bar = ui.G["bar"] * max(1, int(p * 12))
                 alts = "  ".join(f"{t!r}={q:.2f}" for t, q in top5)
-                print(f"{piece!r:<14}{p:>7.3f}   {C['dim']}{alts}{C['reset']}")
+                print(f"  {piece!r:<14}{p:>7.3f} {ui.bot(bar):<14} {ui.faint(alts)}")
+
+        reply = "".join(out_parts)
         self.history.append(("user", message))
         self.history.append(("assistant", reply))
         return reply
+
+
+# --------------------------------------------------------------------------- #
+# menus
+# --------------------------------------------------------------------------- #
+
+
+def settings_menu(s: Settings) -> None:
+    while True:
+        idx = ui.choose("settings", [
+            (f"temperature      {ui.accent(f'{s.temp:g}')}", "higher is more random"),
+            (f"top-k            {ui.accent(str(s.topk))}", "0 disables the cutoff"),
+            (f"max new tokens   {ui.accent(str(s.tokens))}", "per reply"),
+            (f"greedy           {ui.accent('on' if s.greedy else 'off')}",
+             "always take the likeliest token"),
+            (f"probability table {ui.accent('on' if s.probs else 'off')}",
+             "show the top 5 per token"),
+        ])
+        if idx is None:
+            return
+        if idx == 0:
+            s.temp = ui.ask("  temperature", s.temp, float)
+        elif idx == 1:
+            s.topk = ui.ask("  top-k", s.topk, int)
+        elif idx == 2:
+            s.tokens = ui.ask("  max new tokens", s.tokens, int)
+        elif idx == 3:
+            s.greedy = not s.greedy
+        elif idx == 4:
+            s.probs = not s.probs
+
+
+def show_stats(session: Session) -> None:
+    st = session.stats
+    print()
+    print(ui.panel("session", [
+        ("replies", str(st.replies)),
+        ("tokens", f"{st.tokens:,}"),
+        ("generating", f"{st.seconds:.1f}s"),
+        ("average", f"{st.rate:.1f} tok/s"),
+        ("model load", f"{session.load_s:.1f}s"),
+        ("turns held", str(len(session.history) // 2)),
+    ]))
+
+
+def session_menu(session: Session, settings: Settings, search) -> Session | None:
+    """Returns a replacement Session, or the same one, or None to quit."""
+    while True:
+        idx = ui.choose("menu", [
+            ("back to the chat", ""),
+            ("settings", settings.summary()),
+            ("switch model", ui.dim(session.path.name)),
+            ("session stats", f"{session.stats.replies} replies"),
+            ("clear the conversation", f"{len(session.history) // 2} turns held"),
+            ("quit", ""),
+        ], allow_back=False)
+        if idx is None or idx == 0:
+            return session
+        if idx == 1:
+            settings_menu(settings)
+        elif idx == 2:
+            new = checkpoint_menu(search)
+            if new:
+                return Session(new, str(session.device))
+        elif idx == 3:
+            show_stats(session)
+        elif idx == 4:
+            session.history.clear()
+            print(ui.good("  conversation cleared"))
+        elif idx == 5:
+            return None
+
+
+# --------------------------------------------------------------------------- #
 
 
 def main() -> None:
@@ -182,24 +316,29 @@ def main() -> None:
     p.add_argument("--probs", action="store_true", help="show per-token probabilities")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
+
+    ui.detect()
     if args.no_color:
-        no_color()
+        ui.off()
 
     search = [Path(args.dir)] if args.dir else [Path("run"), Path.cwd(), *default_search_dirs()]
-    path = Path(args.model) if args.model else pick_checkpoint(search)
+    print(ui.banner())
+
+    path = Path(args.model) if args.model else checkpoint_menu(search)
     if path is None:
         return
     if not path.exists():
         raise SystemExit(f"no such file: {path}")
 
     session = Session(path, args.device)
-    cfg = {"tokens": args.tokens, "temp": args.temp, "topk": args.topk,
-           "greedy": args.greedy, "probs": args.probs}
-    print(f"{C['dim']}/help for commands, /quit to leave{C['reset']}")
+    settings = Settings(args.tokens, args.temp, args.topk, args.greedy, args.probs)
+    print()
+    print(session.header(settings))
+    print(ui.dim("  /menu for settings, /help for commands, /quit to leave"))
 
     while True:
         try:
-            line = input(f"\n{C['cyan']}you{C['reset']} ").strip()
+            line = input(f"\n{ui.you('you')} {ui.faint(ui.G['arrow'])} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -211,39 +350,53 @@ def main() -> None:
             cmd, arg = parts[0].lower(), (parts[1] if len(parts) > 1 else "")
             if cmd in ("/quit", "/q", "/exit"):
                 return
-            if cmd == "/help":
-                print(__doc__.split("Commands inside the session:")[1])
+            if cmd == "/menu":
+                nxt = session_menu(session, settings, search)
+                if nxt is None:
+                    return
+                if nxt is not session:
+                    session = nxt
+                    print()
+                    print(session.header(settings))
+            elif cmd == "/help":
+                print(ui.dim(__doc__.split("Commands inside the session:")[1]))
+            elif cmd == "/stats":
+                show_stats(session)
             elif cmd == "/reset":
                 session.history.clear()
-                print("conversation cleared")
+                print(ui.good("  conversation cleared"))
             elif cmd == "/model":
-                new = pick_checkpoint(search)
+                new = checkpoint_menu(search)
                 if new:
                     session = Session(new, args.device)
+                    print()
+                    print(session.header(settings))
             elif cmd == "/greedy":
-                cfg["greedy"] = not cfg["greedy"]
-                print(f"greedy = {cfg['greedy']}")
+                settings.greedy = not settings.greedy
+                print(ui.dim(f"  greedy = {settings.greedy}"))
             elif cmd == "/probs":
-                cfg["probs"] = not cfg["probs"]
-                print(f"probs = {cfg['probs']}")
+                settings.probs = not settings.probs
+                print(ui.dim(f"  probs = {settings.probs}"))
             elif cmd in ("/temp", "/topk", "/tokens"):
                 key = cmd[1:]
                 try:
-                    cfg[key] = float(arg) if key == "temp" else int(arg)
-                    print(f"{key} = {cfg[key]}")
+                    value = float(arg) if key == "temp" else int(arg)
+                    setattr(settings, key, value)
+                    print(ui.dim(f"  {key} = {value}"))
                 except ValueError:
-                    print(f"usage: {cmd} <number>   (currently {cfg[key]})")
+                    now = getattr(settings, key)
+                    print(ui.bad(f"  usage: {cmd} <number>   (currently {now})"))
             else:
-                print(f"unknown command {cmd}, try /help")
+                print(ui.bad(f"  unknown command {cmd}, try /help"))
             continue
 
-        label = "model" if session.sft else "continues"
-        print(f"{C['green']}{label}{C['reset']} ", end="", flush=True)
+        label = "model" if session.sft else "cont."
+        print(f"{ui.bot(label)} {ui.faint(ui.G['arrow'])}")
         try:
-            session.reply(line, cfg["tokens"], cfg["temp"], cfg["topk"],
-                          cfg["greedy"], cfg["probs"])
+            session.reply(line, settings.tokens, settings.temp, settings.topk,
+                          settings.greedy, settings.probs)
         except KeyboardInterrupt:
-            print(f"\n{C['dim']}stopped{C['reset']}")
+            print(ui.dim("\n  stopped"))
 
 
 if __name__ == "__main__":
