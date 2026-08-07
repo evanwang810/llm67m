@@ -104,8 +104,10 @@ def _sgr(code: str):
 dim = _sgr("38;5;244")
 faint = _sgr("38;5;240")
 bold = _sgr("1")
-you = _sgr("38;5;39")       # blue
+YOU_CODE = "39"             # blue, as a chip background
+you = _sgr("38;5;39")
 BOT_CODE = "38;5;79"        # teal green, also used by the streamer
+BOT_CODE_N = "79"           # the same hue as a chip background
 bot = _sgr(BOT_CODE)
 accent = _sgr("38;5;180")   # warm sand
 warn = _sgr("38;5;215")
@@ -156,6 +158,17 @@ def banner(subtitle: str = "a small GPT, trained from scratch") -> str:
 # --------------------------------------------------------------------------- #
 
 
+def chip(label: str, code: str) -> str:
+    """A role badge: the colour as a background with dark text on it.
+
+    Reads as a label rather than as coloured text, which is what separates one
+    speaker's block from the next when the reply itself is also coloured.
+    """
+    if not ENABLED:
+        return f"[{label}]"
+    return f"\x1b[48;5;{code};38;5;235m {label} \x1b[0m"
+
+
 class Streamer:
     """Writes generated text into a hanging-indent column, wrapping on words.
 
@@ -165,14 +178,24 @@ class Streamer:
     margin, which stops it looking like a conversation.
     """
 
-    def __init__(self, indent: int = 2, code: str = "") -> None:
+    def __init__(self, indent: int = 2, code: str = "", rail: bool = True) -> None:
         self.indent = indent
-        # Opened once and closed once, rather than wrapping every word: the
+        esc = "\x1b"
+        # A rail down the left of every wrapped line, so a multi-line reply
+        # reads as one block rather than as loose lines under a label.
+        if rail and code and ENABLED:
+            self.rail = f"{esc}[{code}m{G['v']}{esc}[0m "
+        elif rail:
+            self.rail = f"{G['v']} "
+        else:
+            self.rail = ""
+        # Opened once and closed once around the text rather than per word: the
         # result looks identical and the stream stays readable if it is piped.
-        self.open = f"[{code}m" if (code and ENABLED) else ""
-        self.close = "[0m" if self.open else ""
-        self.col = indent
-        self.limit = width() - 2
+        self.open = f"{esc}[{code}m" if (code and ENABLED) else ""
+        self.close = f"{esc}[0m" if self.open else ""
+        self.gutter = 2 if rail else 0
+        self.col = self.gutter
+        self.limit = width() - 4
         self.word = ""
         self.started = False
 
@@ -185,25 +208,28 @@ class Streamer:
             # represent. Losing a glyph beats losing the reply.
             sys.stdout.write(s.encode(enc, "replace").decode(enc, "replace"))
 
+    def _newline(self) -> None:
+        """Close the colour, draw the rail, reopen, so the rail keeps its hue."""
+        self._put(self.close + "\n" + self.rail + self.open)
+        self.col = self.gutter
+
     def _flush_word(self) -> None:
         if not self.word:
             return
         if self.col + len(self.word) > self.limit:
-            self._put("\n" + " " * self.indent)
-            self.col = self.indent
+            self._newline()
         self._put(self.word)
         self.col += len(self.word)
         self.word = ""
 
     def feed(self, piece: str) -> None:
         if not self.started:
-            self._put(self.open + " " * self.indent)
+            self._put(self.rail + self.open)
             self.started = True
         for ch in piece:
             if ch == "\n":
                 self._flush_word()
-                self._put("\n" + " " * self.indent)
-                self.col = self.indent
+                self._newline()
             elif ch == " ":
                 self.word += ch
                 self._flush_word()
@@ -215,7 +241,7 @@ class Streamer:
 
     def done(self) -> None:
         self._flush_word()
-        self._put("\n")
+        self._put(self.close + "\n")
         sys.stdout.flush()
 
 

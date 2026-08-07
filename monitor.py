@@ -144,7 +144,36 @@ def ascii_plot(series: dict[str, tuple[list, list]], width: int = 72, height: in
     return lines
 
 
-def render(rs: RunDir, last: int, width: int, c: dict, height: int = 22) -> str:
+def chart_width(requested: int) -> int:
+    """Braille packs two dots per column, so width is horizontal resolution.
+
+    A committed Kaggle run is not a terminal and reports 80 columns, which is
+    where the cramped charts came from. Fall back to something wide enough to be
+    worth reading; the log pane scrolls.
+    """
+    if requested > 0:
+        return requested
+    try:
+        import shutil
+        cols = shutil.get_terminal_size().columns
+    except Exception:
+        cols = 0
+    return max(130, min(cols - 4, 200)) if cols > 90 else 130
+
+
+def chart_height(requested: int) -> int:
+    """Four dots per row vertically, so 34 rows is 136 points of resolution."""
+    if requested > 0:
+        return requested
+    try:
+        import shutil
+        rows = shutil.get_terminal_size().lines
+    except Exception:
+        rows = 0
+    return max(34, min(rows - 24, 60)) if rows > 60 else 34
+
+
+def render(rs: RunDir, last: int, width: int, c: dict, height: int = 34) -> str:
     st = rs.read_status()
     rows = rs.read_csv()
     out: list[str] = []
@@ -279,8 +308,10 @@ def main() -> None:
     p.add_argument("--exit-file", default="",
                    help="with --until-done, stop when this file appears; it holds the exit code")
     p.add_argument("--last", type=int, default=0, help="chart only the last N steps, 0 is all")
-    p.add_argument("--width", type=int, default=98, help="chart width in columns")
-    p.add_argument("--height", type=int, default=22, help="chart height in rows")
+    p.add_argument("--width", type=int, default=0,
+                   help="chart width in columns, 0 fits the terminal")
+    p.add_argument("--height", type=int, default=0,
+                   help="chart height in rows, 0 picks a large default")
     p.add_argument("--clear", action="store_true", help="redraw in place (terminals, not notebooks)")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--tail", type=int, default=0, help="print the last N train.log lines and exit")
@@ -311,7 +342,8 @@ def main() -> None:
     shown = 0
     started = time.time()
     while True:
-        text = render(rs, args.last, args.width, c, args.height)
+        text = render(rs, args.last, chart_width(args.width),
+                      c, chart_height(args.height))
         if args.clear:
             print("\x1b[2J\x1b[H", end="")
         print(text, flush=True)

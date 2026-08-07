@@ -27,6 +27,7 @@ Commands inside the session:
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,6 +82,28 @@ class Stats:
 # --------------------------------------------------------------------------- #
 # picking a checkpoint
 # --------------------------------------------------------------------------- #
+
+
+def model_search_dirs() -> list[Path]:
+    """Where to look when nobody said. Ordered nearest-first.
+
+    The tool is meant to be launched from anywhere, so the script's own folder
+    counts as much as the working directory, and LLM67M_MODELS lets you point at
+    wherever the downloads actually land without typing --dir every time.
+    """
+    here = Path(__file__).resolve().parent
+    dirs = [Path.cwd(), Path.cwd() / "run", here, here / "run"]
+    env = os.environ.get("LLM67M_MODELS", "")
+    dirs += [Path(p) for p in env.split(os.pathsep) if p.strip()]
+    dirs += [Path.home() / ".llm67m", Path.home() / "Downloads"]
+    dirs += list(default_search_dirs())
+    seen, out = set(), []
+    for d in dirs:
+        key = str(d).lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
 
 
 def checkpoint_menu(search_dirs) -> Path | None:
@@ -321,7 +344,7 @@ def main() -> None:
     if args.no_color:
         ui.off()
 
-    search = [Path(args.dir)] if args.dir else [Path("run"), Path.cwd(), *default_search_dirs()]
+    search = [Path(args.dir)] if args.dir else model_search_dirs()
     print(ui.banner())
 
     path = Path(args.model) if args.model else checkpoint_menu(search)
@@ -390,8 +413,8 @@ def main() -> None:
                 print(ui.bad(f"  unknown command {cmd}, try /help"))
             continue
 
-        label = "model" if session.sft else "cont."
-        print(f"{ui.bot(label)} {ui.faint(ui.G['arrow'])}")
+        label = "MODEL" if session.sft else "CONT."
+        print(ui.chip(label, ui.BOT_CODE_N))
         try:
             session.reply(line, settings.tokens, settings.temp, settings.topk,
                           settings.greedy, settings.probs)
