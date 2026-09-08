@@ -15,7 +15,7 @@ relaunching sessions that already ran, which matters because a session is
 several hours of quota you do not get back.
 
 Credentials are the kaggle CLI's business, not this script's: it shells out and
-the CLI reads ~/.kaggle/kaggle.json the same as always.
+the CLI resolves them itself, from `kaggle auth login` or KAGGLE_API_TOKEN.
 
 Quota is the thing that decides the calendar. A free account gets a fixed
 number of TPU hours per week, so a three session model is spread over more than

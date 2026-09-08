@@ -5,15 +5,18 @@
         --data evanwang810/fineweb-edu-tokens
 
 Generates the kernel script and its metadata, then hands both to the `kaggle`
-CLI. Credentials are never read or printed here: the CLI picks them up from
-~/.kaggle/kaggle.json or KAGGLE_USERNAME / KAGGLE_KEY the same way it does for
-any other command, so this script works without ever seeing the token.
+CLI. Credentials are never read or printed here: the CLI resolves them itself,
+so this script works without ever seeing a token.
 
-Set it up once, if you have not already:
+Set the CLI up once, if you have not already:
 
     pip install kaggle
-    # download kaggle.json from kaggle.com -> Settings -> API -> Create New Token
-    # put it at ~/.kaggle/kaggle.json, or %USERPROFILE% then .kaggle on Windows
+    kaggle auth login
+
+That is a browser OAuth flow on CLI 2.2.x and leaves nothing for you to manage.
+If you would rather use a token, put it in KAGGLE_API_TOKEN or in the file
+~/.kaggle/access_token. The older ~/.kaggle/kaggle.json is not what current
+versions read.
 
 A session is one committed kernel run. For a multi session model, run this once
 per session, passing the previous session's kernel to --resume so its output
