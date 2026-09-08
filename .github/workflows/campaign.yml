@@ -1,0 +1,46 @@
+# Advances the training campaign without your computer being on.
+#
+# Set KAGGLE_API_TOKEN in Settings -> Secrets and variables -> Actions, and
+# KAGGLE_USER as a repository variable. The token never appears in the repo or
+# in a log; Actions masks it.
+#
+# A job caps at 6 hours and a training session takes 8.5, so this does not wait
+# for anything. It wakes, asks Kaggle what is running, pushes the next session
+# if the previous one finished, and exits. Missing a tick costs 30 minutes.
+name: campaign
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      sessions:
+        description: "how many sessions in total"
+        default: "3"
+      preset:
+        description: "model preset"
+        default: "medium"
+
+concurrency:
+  # Two ticks racing could both see a missing kernel and both push it, which
+  # would spend a session of quota twice.
+  group: campaign
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -q kaggle
+      - name: advance the campaign
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          python campaign_tick.py \
+            --user "${{ vars.KAGGLE_USER }}" \
+            --sessions "${{ github.event.inputs.sessions || '3' }}" \
+            --preset "${{ github.event.inputs.preset || 'medium' }}"
