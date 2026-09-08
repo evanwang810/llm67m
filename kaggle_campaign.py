@@ -32,6 +32,8 @@ import sys
 import time
 from pathlib import Path
 
+from campaign_tick import existing_kernels, status_of
+
 STATE = Path(__file__).with_name("campaign.json")
 POLL_SECONDS = 300
 
@@ -66,24 +68,6 @@ def load_state(args) -> dict:
 
 def save_state(state: dict) -> None:
     STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-def kaggle(*cmd: str) -> tuple[int, str]:
-    try:
-        r = subprocess.run(["kaggle", *cmd], capture_output=True, text=True)
-    except FileNotFoundError:
-        raise SystemExit("the kaggle CLI is not installed. pip install kaggle")
-    return r.returncode, (r.stdout + r.stderr).strip()
-
-
-def status_of(kernel_id: str) -> str:
-    """One of running, complete, error, or unknown."""
-    _, out = kaggle("kernels", "status", kernel_id)
-    low = out.lower()
-    for word in ("complete", "error", "cancel", "running", "queued"):
-        if word in low:
-            return word
-    return "unknown"
 
 
 def launch(args, session: int, resume: str) -> str:

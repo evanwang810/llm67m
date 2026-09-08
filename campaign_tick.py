@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Advance a multi-session campaign by one step, then exit.
 
-    python campaign_tick.py --user evanwang810 --sessions 3 --preset medium
+    python campaign_tick.py --user ewang330 --sessions 3 --preset medium
 
 Where kaggle_campaign.py sits in a polling loop and needs your machine on, this
 does one pass and quits, so it can run from cron or a GitHub Actions schedule
@@ -21,6 +21,7 @@ which is what stops a stray tick from spending quota twice.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,20 +44,49 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def status_of(kernel_id: str) -> str:
-    """running, queued, complete, error, cancel, or missing."""
+def kaggle(*cmd: str) -> tuple[int, str]:
     try:
-        r = subprocess.run(["kaggle", "kernels", "status", kernel_id],
-                           capture_output=True, text=True)
+        r = subprocess.run(["kaggle", *cmd], capture_output=True, text=True)
     except FileNotFoundError:
         raise SystemExit("the kaggle CLI is not installed. pip install kaggle")
-    out = (r.stdout + r.stderr).lower()
-    # A kernel that was never pushed reports as not found rather than failing in
-    # a way worth distinguishing, and both mean the same thing here: push it.
-    if "404" in out or "not found" in out or "could not find" in out:
-        return MISSING
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def existing_kernels(user: str) -> set[str]:
+    """Every kernel ref this account owns.
+
+    Existence has to be read from a listing rather than probed with `kernels
+    status`, because a kernel that was never pushed comes back as an HTTP 403
+    carrying a permissions message, which is the identical response to a kernel
+    that exists but is not readable. Reading "missing" out of that would push a
+    session on top of a permissions problem and spend hours of quota doing it.
+    """
+    rc, out = kaggle("kernels", "list", "--mine", "--format", "json",
+                     "--page-size", "200")
+    if rc != 0:
+        raise SystemExit("could not list your kernels, so nothing here is safe "
+                         "to decide:\n" + out)
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        # An empty account prints a human sentence rather than an empty array.
+        if "no kernels" in out.lower():
+            return set()
+        raise SystemExit("unexpected output from kernels list:\n" + out)
+    slugs = set()
+    for row in rows:
+        ref = row.get("ref") or ""
+        if ref:
+            slugs.add(ref if "/" in ref else f"{user}/{ref}")
+    return slugs
+
+
+def status_of(kernel_id: str) -> str:
+    """running, queued, complete, error or cancel, for a kernel known to exist."""
+    _, out = kaggle("kernels", "status", kernel_id)
+    low = out.lower()
     for word in ("complete", "error", "cancel", "running", "queued"):
-        if word in out:
+        if word in low:
             return word
     return "unknown"
 
@@ -81,10 +111,12 @@ def push(args, session: int) -> int:
 
 def main() -> None:
     args = parse_args()
+    have = existing_kernels(args.user)
+    print(f"{len(have)} kernels on the account", flush=True)
 
     for session in range(1, args.sessions + 1):
         kernel_id = f"{args.user}/llm67m-{args.preset}-s{session}"
-        st = status_of(kernel_id)
+        st = status_of(kernel_id) if kernel_id in have else MISSING
         print(f"session {session}: {kernel_id} is {st}", flush=True)
 
         if st == "complete":
@@ -96,8 +128,8 @@ def main() -> None:
             raise SystemExit(
                 f"session {session} ended as {st} and the campaign is stuck.\n"
                 f"  kaggle kernels output {kernel_id} -p ./out\n"
-                f"Fix the cause, delete that kernel on Kaggle, and the next tick "
-                f"will push it again.")
+                "Fix the cause, delete that kernel on Kaggle, and the next tick "
+                "will push it again.")
         if st == MISSING:
             print(f"pushing session {session}", flush=True)
             raise SystemExit(push(args, session))
