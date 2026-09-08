@@ -52,6 +52,12 @@ PRESETS: dict[str, dict] = {
     # the Chinchilla-optimal model there is about 179M total on 3.5B tokens.
     # GPT-2 small's width made deeper, so head_dim stays at 64.
     "tpu1session": {"n_layer": 19, "n_head": 12, "n_embd": 768},
+    # 302.0M non-embedding, 353.6M total. The GPT-2 medium shape, so the loss
+    # curve is directly comparable to a published number instead of only to
+    # itself. Chinchilla wants 7.1B tokens on it, which is 1.5e19 FLOPs, or
+    # three 8.5 hour TPU v3-8 sessions at the 163 TFLOP/s this actually runs at.
+    # Adam state is 5.7GB of the 15.75GB per core, leaving room for activations.
+    "medium": {"n_layer": 24, "n_head": 16, "n_embd": 1024},
 }
 PRESETS["gpt2-small"] = PRESETS["125m"]
 

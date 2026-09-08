@@ -19,7 +19,7 @@ Commands inside the session:
     /tokens 128       max new tokens per reply
     /greedy           toggle argmax sampling
     /probs            toggle the per-token probability table
-    /history 0        previous turns to carry, 0 suits an Alpaca-tuned model
+    /history 0        previous turns to carry, 0 for a single-turn tuned model
     /stats            what this session has generated so far
     /reset            clear the conversation
     /help  /quit
@@ -153,6 +153,12 @@ class Session:
         self.user_token = ckpt.get("user_token", USER_TOKEN)
         self.assistant_token = ckpt.get("assistant_token", ASSISTANT_TOKEN)
         self.step = ckpt.get("step", 0)
+        # Whether carrying history helps is a property of the tuning data, not
+        # of the chat tool: a model tuned only on single turn data reads a
+        # previous exchange as a pattern to repeat rather than as context.
+        self.sft_dataset = str(ckpt.get("sft_dataset", ""))
+        self.multi_turn = self.sft and "alpaca" not in self.sft_dataset.lower() \
+            and bool(self.sft_dataset)
         self.params = sum(p.numel() for p in self.model.parameters())
         import tiktoken
 
@@ -355,6 +361,8 @@ def main() -> None:
     p.add_argument("--topk", type=int, default=40)
     p.add_argument("--greedy", action="store_true")
     p.add_argument("--probs", action="store_true", help="show per-token probabilities")
+    p.add_argument("--history", type=int, default=-1,
+                   help="previous turns to carry, -1 picks from the tuning data")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
 
@@ -373,6 +381,8 @@ def main() -> None:
 
     session = Session(path, args.device)
     settings = Settings(args.tokens, args.temp, args.topk, args.greedy, args.probs)
+    settings.history = (args.history if args.history >= 0
+                        else (4 if session.multi_turn else 0))
     print()
     print(session.header(settings))
     print(ui.dim("  /menu for settings, /help for commands, /quit to leave"))

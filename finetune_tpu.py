@@ -128,14 +128,34 @@ def _mp_fn(index, args):  # noqa: ARG001
         lo = cursor + ordinal * args.batch_size
         idx = order[lo : lo + args.batch_size]
         cursor += span
-        return (torch.from_numpy(xs[idx]).to(dev),
-                torch.from_numpy(ys[idx]).to(dev))
+        # build_dataset stores int32 to keep a large mix resident; embedding
+        # lookup and cross entropy both want int64.
+        return (torch.from_numpy(xs[idx]).long().to(dev),
+                torch.from_numpy(ys[idx]).long().to(dev))
 
     model.train()
     say("finetuning\n")
 
     stopped_at = total_steps
-    for step in range(total_steps):
+    hard_cap = total_steps
+    started = time.time()
+    for step in range(hard_cap):
+        if step == 30:
+            # Refit the cosine to the time actually available: cutting it off
+            # partway leaves the model parked at a high learning rate, which
+            # undoes much of what the tuning was for. Replicas do not agree on
+            # their own clocks, so the fitted length comes from replica zero
+            # through a collective rather than from each replica separately.
+            rate = (time.time() - started) / 30
+            fits = int((deadline - started) / rate) if master else 0
+            fits = X.mesh_reduce("sft-fit", fits, max)
+            if fits < total_steps:
+                total_steps = max(args.warmup + 10, fits)
+                stopped_at = total_steps
+                say(f"schedule refit to {total_steps:,} steps to finish in "
+                    f"{args.hours}h at {rate:.2f}s/step")
+        if step >= total_steps:
+            break
         frac = step / max(1, total_steps)
         if step < args.warmup:
             lr = args.lr * (step + 1) / args.warmup

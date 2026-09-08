@@ -309,6 +309,9 @@ if [ -n "${SFT_HOURS:-}" ]; then
   # would silently tune on the host and never finish.
   SFT_SCRIPT=finetune.py
   if [ "$DEVICE" = "tpu" ]; then SFT_SCRIPT=finetune_tpu.py; fi
-  echo "=== instruction tuning for ${SFT_HOURS}h (${SFT_SCRIPT}) ==="
-  exec python "$SFT_SCRIPT" --run-dir "$RUN" --hours "$SFT_HOURS"
+  # SFT_DATA takes any --dataset value: a MIXES shorthand ("chat", "smol",
+  # "alpaca") or an explicit name[:config][:weight] list.
+  echo "=== instruction tuning for ${SFT_HOURS}h on ${SFT_DATA:-chat} (${SFT_SCRIPT}) ==="
+  exec python "$SFT_SCRIPT" --run-dir "$RUN" --hours "$SFT_HOURS" \
+    --dataset "${SFT_DATA:-chat}" ${SFT_EXTRA:-}
 fi
