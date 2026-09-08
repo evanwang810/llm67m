@@ -18,3 +18,5 @@ status.json
 kaggle.json
 kernel-metadata.json
 dataset-metadata.json
+campaign.json
+kernel_payload/
