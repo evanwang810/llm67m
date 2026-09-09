@@ -77,23 +77,45 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default="", help="tokens dataset, user/slug")
     p.add_argument("--resume", default="",
                    help="previous session's kernel, user/slug, mounted for its checkpoint")
+    p.add_argument("--mode", choices=("train", "tokenize"), default="train")
+    p.add_argument("--mount", action="append", default=[],
+                   help="extra kernel to mount, user/slug, repeatable")
     p.add_argument("--public", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="write the folder, do not push")
     return p.parse_args()
 
 
 def build_payload(args, out: Path) -> tuple[Path, str]:
-    slug = args.slug or f"llm67m-{args.preset}-s{args.session}"
+    if args.mode == "tokenize":
+        # Its own CPU kernel, run once. Tokenizing costs no accelerator quota,
+        # its output is only the shards so it stays under the size cap, and
+        # every training session mounts it instead of redoing the work. On the
+        # training side this needs no wiring: kaggle_run.sh already globs
+        # /kaggle/input for a meta.json.
+        slug = args.slug or f"llm67m-tokens-{args.tokens}"
+        # kaggle_run.sh normally does the pip install, and this path skips it.
+        cmd = ["bash", "-c",
+               "pip install -q tiktoken datasets && "
+               "python tokenize_fineweb.py --out-dir /kaggle/working/tokens "
+               f"--max-tokens {args.tokens}"]
+        env = {}
+        device = "none"
+    else:
+        slug = args.slug or f"llm67m-{args.preset}-s{args.session}"
+        cmd = ["bash", "kaggle_run.sh", str(args.hours), args.preset, args.tokens]
+        env = {"DEVICE": args.device, "MONITOR": "1"}
+        if args.sft_hours > 0:
+            env["SFT_HOURS"] = str(args.sft_hours)
+            env["SFT_DATA"] = args.sft_data
+        device = args.device
+
+    slug = slug.replace(".", "-")  # a kernel slug cannot carry a dot
     kernel_id = f"{args.user}/{slug}"
 
-    cmd = ["bash", "kaggle_run.sh", str(args.hours), args.preset, args.tokens]
-    env = {"DEVICE": args.device, "MONITOR": "1"}
-    if args.sft_hours > 0:
-        env["SFT_HOURS"] = str(args.sft_hours)
-        env["SFT_DATA"] = args.sft_data
     # Nothing to set for a resume: pick_resume_checkpoint globs /kaggle/input
     # through default_search_dirs and takes the newest full checkpoint, so
     # mounting the previous kernel below is the whole of the wiring.
+    sources = [m for m in ([args.resume] if args.resume else []) + args.mount if m]
 
     (out / "run.py").write_text(
         SCRIPT.format(repo=REPO, cmd=cmd, env=env), encoding="utf-8")
@@ -106,14 +128,14 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         "kernel_type": "script",
         "is_private": not args.public,
         "enable_internet": True,
-        "enable_gpu": args.device in ("t4x2", "p100"),
+        "enable_gpu": device in ("t4x2", "p100"),
         "dataset_sources": [args.data] if args.data else [],
-        "kernel_sources": [args.resume] if args.resume else [],
+        "kernel_sources": sources,
         "competition_sources": [],
         "model_sources": [],
     }
-    if MACHINES[args.device]:
-        meta["machine_shape"] = MACHINES[args.device]
+    if MACHINES[device]:
+        meta["machine_shape"] = MACHINES[device]
     (out / "kernel-metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return out, kernel_id
 

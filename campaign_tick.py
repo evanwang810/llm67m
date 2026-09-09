@@ -40,6 +40,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default="")
     p.add_argument("--device", default="tpu")
     p.add_argument("--sft-hours", type=float, default=1.0)
+    p.add_argument("--no-tokenize", action="store_true",
+                   help="skip the tokenize kernel, the corpus already exists")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -91,12 +93,18 @@ def status_of(kernel_id: str) -> str:
     return "unknown"
 
 
-def push(args, session: int) -> int:
+def tokens_slug(args) -> str:
+    return f"llm67m-tokens-{args.tokens}".replace(".", "-")
+
+
+def push(args, session: int, mount: str = "") -> int:
     cmd = [sys.executable, str(Path(__file__).with_name("kaggle_launch.py")),
            "--user", args.user, "--session", str(session), "--preset", args.preset,
            "--hours", str(args.hours), "--tokens", args.tokens, "--device", args.device]
     if args.data:
         cmd += ["--data", args.data]
+    if mount:
+        cmd += ["--mount", mount]
     if session > 1:
         cmd += ["--resume", f"{args.user}/llm67m-{args.preset}-s{session - 1}"]
     if session == args.sessions and args.sft_hours > 0:
@@ -113,6 +121,29 @@ def main() -> None:
     args = parse_args()
     have = existing_kernels(args.user)
     print(f"{len(have)} kernels on the account", flush=True)
+
+    # The corpus is tokenized once, in its own CPU kernel, and every training
+    # session mounts it. Doing it inside session one instead would redo the work
+    # each session, or carry 15GB of shards through the output of every one.
+    tokens_id = f"{args.user}/{tokens_slug(args)}"
+    if not args.no_tokenize:
+        if tokens_id not in have:
+            print(f"pushing the tokenize kernel {tokens_id}", flush=True)
+            cmd = [sys.executable, str(Path(__file__).with_name("kaggle_launch.py")),
+                   "--user", args.user, "--mode", "tokenize", "--tokens", args.tokens]
+            if args.dry_run:
+                cmd += ["--dry-run"]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            sys.stdout.write(r.stdout)
+            sys.stderr.write(r.stderr)
+            raise SystemExit(r.returncode)
+        st = status_of(tokens_id)
+        print(f"tokens: {tokens_id} is {st}", flush=True)
+        if st in ("running", "queued"):
+            print("corpus still tokenizing, nothing to do this tick")
+            return
+        if st != "complete":
+            raise SystemExit(f"the tokenize kernel ended as {st}, campaign stuck")
 
     for session in range(1, args.sessions + 1):
         kernel_id = f"{args.user}/llm67m-{args.preset}-s{session}"
@@ -132,7 +163,8 @@ def main() -> None:
                 "will push it again.")
         if st == MISSING:
             print(f"pushing session {session}", flush=True)
-            raise SystemExit(push(args, session))
+            raise SystemExit(push(args, session,
+                                  "" if args.no_tokenize else tokens_id))
         raise SystemExit(f"unrecognised status for {kernel_id}, not guessing")
 
     print("all sessions complete")
