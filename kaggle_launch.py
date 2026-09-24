@@ -84,6 +84,8 @@ def parse_args() -> argparse.Namespace:
                    help="no LR decay at the end, for every session but the last")
     p.add_argument("--reset-decay", action="store_true",
                    help="resume past a decay stored in the checkpoint")
+    p.add_argument("--decay-fraction", type=float, default=0.0,
+                   help="decay over this fraction of the session, for a final session")
     p.add_argument("--public", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="write the folder, do not push")
     return p.parse_args()
@@ -112,6 +114,8 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
             env["DECAY"] = "0"
         if args.reset_decay:
             env["RESET_DECAY"] = "1"
+        if args.decay_fraction > 0:
+            env["DECAY_FRACTION"] = str(args.decay_fraction)
         if args.sft_hours > 0:
             env["SFT_HOURS"] = str(args.sft_hours)
             env["SFT_DATA"] = args.sft_data

@@ -79,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--lr", type=float, default=t.lr)
     g.add_argument("--min-lr", type=float, default=t.min_lr)
     g.add_argument("--warmup-steps", type=int, default=t.warmup_steps)
+    g.add_argument("--rewarm-steps", type=int, default=500,
+                   help="after --reset-decay, climb back from min LR over this many steps")
     g.add_argument("--decay-steps", type=int, default=t.decay_steps)
     g.add_argument("--weight-decay", type=float, default=t.weight_decay)
     g.add_argument("--grad-clip", type=float, default=t.grad_clip)
@@ -253,6 +255,13 @@ def sample_text(raw_model, device, prompt: str, max_new: int,
 def lr_at(step: int, args: argparse.Namespace, decay_start: int | None) -> float:
     if step < args.warmup_steps:
         return args.lr * (step + 1) / max(1, args.warmup_steps)
+    # A run picked back up after its decay finished sits at min LR. Jumping
+    # straight back to peak is the classic way to get a loss spike, so it
+    # climbs back over rewarm_steps, the same as continued pretraining does.
+    rewarm = getattr(args, "rewarm_from", None)
+    if rewarm is not None and step < rewarm + args.rewarm_steps:
+        frac = (step - rewarm + 1) / max(1, args.rewarm_steps)
+        return args.min_lr + (args.lr - args.min_lr) * frac
     if decay_start is None or step < decay_start:
         return args.lr
     p = min(1.0, (step - decay_start) / max(1, args.decay_steps))
@@ -533,7 +542,9 @@ def main() -> None:
         ckpt, has_optim = load_resume(info, model, args, fingerprint)
         step = int(ckpt["step"])
         tokens_seen = int(ckpt.get("tokens_seen", step * tokens_per_step))
-        decay_start = None if args.reset_decay else ckpt.get("decay_start")
+        decay_start = ckpt.get("decay_start")
+        if args.reset_decay and decay_start is not None:
+            decay_start, args.rewarm_from = None, step
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")  # keeps the smoothed curve continuous across restarts
         if has_optim:

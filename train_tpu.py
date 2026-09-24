@@ -188,7 +188,10 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             quiet.close()
         step = int(ckpt["step"])
         tokens_seen = int(ckpt.get("tokens_seen", 0))
-        decay_start = None if args.reset_decay else ckpt.get("decay_start")
+        decay_start = ckpt.get("decay_start")
+        if args.reset_decay and decay_start is not None:
+            # Every replica reads the same checkpoint, so they agree on this.
+            decay_start, args.rewarm_from = None, step
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")
         resume_optimizer = ckpt["optimizer"] if has_optim else None

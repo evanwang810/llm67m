@@ -1,38 +1,48 @@
 #!/usr/bin/env python
 """Advance a multi-session campaign by one step, then exit.
 
-    python campaign_tick.py --user ewang330 --sessions 3 --preset medium
+    python campaign_tick.py --user ewang330 --name llm67m-medium-r2 --sessions 10 \\
+        --preset medium --seed-from ewang330/llm67m-medium-s1
 
 Where kaggle_campaign.py sits in a polling loop and needs your machine on, this
 does one pass and quits, so it can run from cron or a GitHub Actions schedule
 with nothing of yours turned on.
 
-It keeps no state. Every decision comes from asking Kaggle what the session
-kernels are doing right now, which means a missed tick, a double tick, or two
-of them racing all land on the same answer. The rule is only:
+It keeps no state. Every decision comes from asking Kaggle what the campaign's
+kernels are doing right now, so a missed tick, a double tick, or two of them
+racing all land on the same answer. Per tick it does at most one thing:
 
-    the first session that is not complete is the one to care about,
-    and it gets pushed only if it does not exist yet.
+    tokenize the corpus if that has not happened,
+    otherwise find the first session with no completed attempt, and
+        leave it alone if an attempt is queued or running,
+        wait if another session would go over the weekly TPU quota,
+        otherwise push its next attempt.
 
-so a session that is queued or running is left alone rather than relaunched,
-which is what stops a stray tick from spending quota twice.
+A failed session is retried a limited number of times, each attempt a new
+kernel that mounts the earlier ones, so whatever checkpoint a crashed attempt
+got to is where the retry resumes. After that it stops and says why, because a
+failure that repeats is a bug, and retrying a bug spends quota on nothing.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 MISSING = "missing"
+WEEK = timedelta(days=7)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--user", required=True)
+    p.add_argument("--name", default="", help="campaign name, default llm67m-<preset>")
     p.add_argument("--sessions", type=int, default=3)
     p.add_argument("--preset", default="medium")
     p.add_argument("--hours", type=float, default=8.5)
@@ -40,24 +50,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default="")
     p.add_argument("--device", default="tpu")
     p.add_argument("--sft-hours", type=float, default=1.0)
+    p.add_argument("--seed-from", default="",
+                   help="kernel whose checkpoint session 1 continues from, user/slug")
+    p.add_argument("--retries", type=int, default=2, help="extra attempts per session")
+    p.add_argument("--tpu-quota-hours", type=float, default=20.0,
+                   help="weekly TPU allowance; sessions are paced to stay under it")
+    p.add_argument("--decay-fraction", type=float, default=0.75,
+                   help="share of the final session spent decaying the LR")
     p.add_argument("--no-tokenize", action="store_true",
                    help="skip the tokenize kernel, the corpus already exists")
-    p.add_argument("--reset-decay-at", type=int, action="append", default=[],
-                   help="session number that resumes past a stored decay")
     p.add_argument("--dry-run", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    args.name = args.name or f"llm67m-{args.preset}"
+    return args
 
 
 def kaggle(*cmd: str) -> tuple[int, str]:
+    # Kernel logs carry whatever the model printed, and a Windows console
+    # cannot encode most of it; the CLI dies mid-print rather than replacing.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
     try:
-        r = subprocess.run(["kaggle", *cmd], capture_output=True, text=True)
+        r = subprocess.run(["kaggle", *cmd], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", env=env)
     except FileNotFoundError:
         raise SystemExit("the kaggle CLI is not installed. pip install kaggle")
-    return r.returncode, (r.stdout + r.stderr).strip()
+    return r.returncode, ((r.stdout or "") + (r.stderr or "")).strip()
 
 
-def existing_kernels(user: str) -> set[str]:
-    """Every kernel ref this account owns.
+def existing_kernels(user: str) -> dict[str, datetime | None]:
+    """Every kernel ref this account owns, with when it last ran.
 
     Existence has to be read from a listing rather than probed with `kernels
     status`, because a kernel that was never pushed comes back as an HTTP 403
@@ -75,61 +96,122 @@ def existing_kernels(user: str) -> set[str]:
     except json.JSONDecodeError:
         # An empty account prints a human sentence rather than an empty array.
         if "no kernels" in out.lower():
-            return set()
+            return {}
         raise SystemExit("unexpected output from kernels list:\n" + out)
-    slugs = set()
+    found: dict[str, datetime | None] = {}
     for row in rows:
         ref = row.get("ref") or ""
-        if ref:
-            slugs.add(ref if "/" in ref else f"{user}/{ref}")
-    return slugs
+        if not ref:
+            continue
+        ref = ref if "/" in ref else f"{user}/{ref}"
+        when = None
+        if row.get("lastRunTime"):
+            try:
+                when = datetime.fromisoformat(row["lastRunTime"]).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        found[ref] = when
+    return found
 
 
 def status_of(kernel_id: str) -> str:
     """running, queued, complete, error or cancel, for a kernel known to exist."""
     _, out = kaggle("kernels", "status", kernel_id)
     low = out.lower()
+    # NEW_SCRIPT is what a kernel reports in the minutes after a push, before
+    # it is queued. Treating it as unknown stopped the campaign right there.
+    if "new_script" in low:
+        return "queued"
     for word in ("complete", "error", "cancel", "running", "queued"):
         if word in low:
             return word
     return "unknown"
 
 
-def tokens_slug(args) -> str:
-    return f"llm67m-tokens-{args.tokens}".replace(".", "-")
+def log_entries(kernel_id: str) -> list[dict]:
+    """A finished kernel's log as parsed entries, or [] if it cannot be read."""
+    _, out = kaggle("kernels", "logs", kernel_id)
+    entries = []
+    for line in out.splitlines():
+        line = line.strip().lstrip("[,").rstrip("]")
+        if not line.startswith("{"):
+            continue
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return entries
 
 
-def push(args, session: int, mount: str = "") -> int:
-    cmd = [sys.executable, str(Path(__file__).with_name("kaggle_launch.py")),
-           "--user", args.user, "--session", str(session), "--preset", args.preset,
-           "--hours", str(args.hours), "--tokens", args.tokens, "--device", args.device]
-    if args.data:
-        cmd += ["--data", args.data]
-    if mount:
-        cmd += ["--mount", mount]
-    if session > 1:
-        cmd += ["--resume", f"{args.user}/llm67m-{args.preset}-s{session - 1}"]
-    # Only the final session decays. Decaying at the end of an earlier one
-    # marks the run finished, and every later session resumes a model that is
-    # already done and trains nothing, which is how two sessions got spent.
-    if session < args.sessions:
-        cmd += ["--no-decay"]
-    if session in args.reset_decay_at:
-        cmd += ["--reset-decay"]
-    if session == args.sessions and args.sft_hours > 0:
-        cmd += ["--sft-hours", str(args.sft_hours)]
-    if args.dry_run:
-        cmd += ["--dry-run"]
+def hours_used(kernel_id: str, status: str, budget: float) -> float:
+    """TPU hours a session attempt consumed, read from its log where possible.
+
+    A running attempt, or one whose log will not parse, is charged its whole
+    budget. Overcounting only makes the next session wait longer; undercounting
+    is what runs into the quota wall halfway through a session.
+    """
+    if status in ("running", "queued"):
+        return budget
+    times = [e.get("time", 0) for e in log_entries(kernel_id)]
+    return max(times) / 3600 if times else budget
+
+
+def tail_log(kernel_id: str, lines: int = 25) -> str:
+    text = "".join(e.get("data", "") for e in log_entries(kernel_id))
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def launcher() -> list[str]:
+    return [sys.executable, str(Path(__file__).with_name("kaggle_launch.py"))]
+
+
+def run(cmd: list[str]) -> int:
     r = subprocess.run(cmd, capture_output=True, text=True)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
     return r.returncode
 
 
+def tokens_slug(args) -> str:
+    return f"llm67m-tokens-{args.tokens}".replace(".", "-")
+
+
+def attempt_ids(args, session: int) -> list[str]:
+    base = f"{args.user}/{args.name}-s{session}"
+    return [base] + [f"{base}-a{k}" for k in range(2, args.retries + 2)]
+
+
+def push_session(args, session: int, slug: str, mounts: list[str]) -> int:
+    cmd = launcher() + [
+        "--user", args.user, "--slug", slug, "--session", str(session),
+        "--preset", args.preset, "--hours", str(args.hours), "--tokens", args.tokens,
+        "--device", args.device]
+    if args.data:
+        cmd += ["--data", args.data]
+    for m in mounts:
+        cmd += ["--mount", m]
+    final = session == args.sessions
+    # Only the final session decays. Decaying at the end of an earlier one marks
+    # the run finished, and every later session resumes a model that is already
+    # done and trains nothing, which is how two sessions got spent before.
+    if not final:
+        cmd += ["--no-decay"]
+    else:
+        cmd += ["--decay-fraction", str(args.decay_fraction)]
+        if args.sft_hours > 0:
+            cmd += ["--sft-hours", str(args.sft_hours)]
+    if session == 1 and args.seed_from:
+        cmd += ["--reset-decay"]
+    if args.dry_run:
+        cmd += ["--dry-run"]
+    return run(cmd)
+
+
 def main() -> None:
     args = parse_args()
     have = existing_kernels(args.user)
-    print(f"{len(have)} kernels on the account", flush=True)
+    print(f"{len(have)} kernels on the account; campaign {args.name}, "
+          f"{args.sessions} sessions of {args.preset}", flush=True)
 
     # The corpus is tokenized once, in its own CPU kernel, and every training
     # session mounts it. Doing it inside session one instead would redo the work
@@ -138,14 +220,9 @@ def main() -> None:
     if not args.no_tokenize:
         if tokens_id not in have:
             print(f"pushing the tokenize kernel {tokens_id}", flush=True)
-            cmd = [sys.executable, str(Path(__file__).with_name("kaggle_launch.py")),
-                   "--user", args.user, "--mode", "tokenize", "--tokens", args.tokens]
-            if args.dry_run:
-                cmd += ["--dry-run"]
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            sys.stdout.write(r.stdout)
-            sys.stderr.write(r.stderr)
-            raise SystemExit(r.returncode)
+            cmd = launcher() + ["--user", args.user, "--mode", "tokenize",
+                                "--tokens", args.tokens]
+            raise SystemExit(run(cmd + (["--dry-run"] if args.dry_run else [])))
         st = status_of(tokens_id)
         print(f"tokens: {tokens_id} is {st}", flush=True)
         if st in ("running", "queued"):
@@ -154,27 +231,74 @@ def main() -> None:
         if st != "complete":
             raise SystemExit(f"the tokenize kernel ended as {st}, campaign stuck")
 
-    for session in range(1, args.sessions + 1):
-        kernel_id = f"{args.user}/llm67m-{args.preset}-s{session}"
-        st = status_of(kernel_id) if kernel_id in have else MISSING
-        print(f"session {session}: {kernel_id} is {st}", flush=True)
-
-        if st == "complete":
-            continue
+    # Session 1 continues from the seed's checkpoint, so the seed has to have
+    # finished. This is also what gates a campaign on a verification run: until
+    # that kernel completes the campaign waits, and if it fails, it stops.
+    if args.seed_from:
+        if args.seed_from not in have:
+            raise SystemExit(f"seed kernel {args.seed_from} does not exist")
+        st = status_of(args.seed_from)
         if st in ("running", "queued"):
+            print(f"seed {args.seed_from} is {st}, waiting for it")
+            return
+        if st != "complete":
+            raise SystemExit(f"seed {args.seed_from} ended as {st}, not starting on it")
+
+    now = datetime.now(timezone.utc)
+    window_used = 0.0
+    previous = args.seed_from
+
+    for session in range(1, args.sessions + 1):
+        attempts = [a for a in attempt_ids(args, session) if a in have]
+        states = {a: status_of(a) for a in attempts}
+        done = next((a for a in attempts if states[a] == "complete"), None)
+
+        # Quota spent inside the last week, counted as we pass each session.
+        # The window runs an extra session length back, because a session that
+        # finished just inside it may have started just outside and still used
+        # hours that count against this week.
+        for a in attempts:
+            when = have.get(a)
+            if when and now - when <= WEEK + timedelta(hours=args.hours):
+                window_used += hours_used(a, states[a], args.hours)
+
+        if done:
+            print(f"session {session}: complete as {done}")
+            previous = done
+            continue
+
+        latest = attempts[-1] if attempts else None
+        state = states.get(latest, MISSING)
+        print(f"session {session}: {len(attempts)} attempt(s), latest "
+              f"{latest or '-'} is {state}", flush=True)
+
+        if state in ("running", "queued"):
             print("still going, nothing to do this tick")
             return
-        if st in ("error", "cancel"):
-            raise SystemExit(
-                f"session {session} ended as {st} and the campaign is stuck.\n"
-                f"  kaggle kernels output {kernel_id} -p ./out\n"
-                "Fix the cause, delete that kernel on Kaggle, and the next tick "
-                "will push it again.")
-        if st == MISSING:
-            print(f"pushing session {session}", flush=True)
-            raise SystemExit(push(args, session,
-                                  "" if args.no_tokenize else tokens_id))
-        raise SystemExit(f"unrecognised status for {kernel_id}, not guessing")
+        if state == "unknown":
+            raise SystemExit(f"unrecognised status for {latest}, not guessing")
+        if state in ("error", "cancel"):
+            print(f"--- last lines of {latest} ---\n{tail_log(latest)}\n---", flush=True)
+            if len(attempts) > args.retries:
+                raise SystemExit(
+                    f"session {session} failed {len(attempts)} times; that is a bug, "
+                    f"not bad luck. Fix it, delete the failed kernels, and the next "
+                    f"tick starts the session again.")
+
+        if args.device == "tpu" and window_used + args.hours > args.tpu_quota_hours:
+            print(f"waiting on quota: {window_used:.1f}h of TPU used in the last week, "
+                  f"another {args.hours}h session would pass {args.tpu_quota_hours}h")
+            return
+
+        slug = attempt_ids(args, session)[len(attempts)].split("/", 1)[1]
+        # Everything that could hold the newest checkpoint: the previous session,
+        # and this session's own failed attempts if there were any. The trainer
+        # resumes from whichever mounted checkpoint has the highest step.
+        mounts = [m for m in [previous, *attempts] if m]
+        if not args.no_tokenize:
+            mounts.append(tokens_id)
+        print(f"pushing session {session} as {slug}, mounting {mounts}", flush=True)
+        raise SystemExit(push_session(args, session, slug, mounts))
 
     print("all sessions complete")
 

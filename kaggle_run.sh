@@ -201,6 +201,19 @@ else
   fi
 fi
 
+# DECAY_FRACTION stretches the decay over that fraction of this session. The
+# default length is sized for one session, which for a long multi session run
+# is a cooldown of well under 1% of training, where 10 to 20% is what matches
+# a full cosine. The step time comes from the preflight that just ran.
+if [ -n "${DECAY_FRACTION:-}" ] && [ -f "$RUN/preflight.json" ]; then
+  DECAY_STEPS="$(python - "$RUN/preflight.json" "$TRAIN_HOURS" "$DECAY_FRACTION" <<'PY'
+import json, sys
+spp = float(json.load(open(sys.argv[1]))["secs_per_step"])
+print(max(200, int(float(sys.argv[3]) * float(sys.argv[2]) * 3600 / spp)))
+PY
+)"
+fi
+
 echo "=== training ${TRAIN_HOURS}h on ${DEVICE}, decay ${DECAY_STEPS} steps, "\
 "milestone every ${MILESTONE_MIN} min ==="
 

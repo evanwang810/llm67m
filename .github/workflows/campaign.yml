@@ -13,13 +13,6 @@ on:
   schedule:
     - cron: "*/30 * * * *"
   workflow_dispatch:
-    inputs:
-      sessions:
-        description: "how many sessions in total"
-        default: "3"
-      preset:
-        description: "model preset"
-        default: "medium"
 
 concurrency:
   # Two ticks racing could both see a missing kernel and both push it, which
@@ -39,8 +32,13 @@ jobs:
       - name: advance the campaign
         env:
           KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        # Ten sessions of the medium preset, continuing from the verification run
+        # that proved the decay, re-warm and tuning fixes on a real TPU. Sessions
+        # are paced to the weekly TPU quota, so this takes about five weeks.
         run: |
           python campaign_tick.py \
             --user "${{ vars.KAGGLE_USER }}" \
-            --sessions "${{ github.event.inputs.sessions || '3' }}" \
-            --preset "${{ github.event.inputs.preset || 'medium' }}"
+            --name llm67m-medium-r2 \
+            --sessions 10 \
+            --preset medium \
+            --seed-from "${{ vars.KAGGLE_USER }}/llm67m-medium-verify"
