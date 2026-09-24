@@ -266,7 +266,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     start_step = step
     # See train.py: the decay trigger wants the session pace, not the last
     # interval, or one checkpoint write reads as a slowdown and ends the run.
-    pace_t0, pace_step0 = time.time(), step
+    pace_t0, pace_step0, pace_warm = time.time(), step, False
     lr = quantized_lr(step, args, decay_start)
     val_loss: float | None = None
     stop_reason = ""
@@ -321,7 +321,14 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             if args.max_steps and step >= args.max_steps:
                 local |= 1 << 2
                 stop_reason = stop_reason or "max-steps"
-            if args.auto_decay and decay_start is None and step - pace_step0 >= 50:
+            # The clock restarts once, 20 steps in. The first steps carry the compile,
+            # minutes of it on XLA, and folded into the average that reads as a pace
+            # several times too slow, which with a long cooldown starts the decay at
+            # once and finishes it hours before the deadline.
+            if not pace_warm and step - pace_step0 >= 20:
+                pace_t0, pace_step0, pace_warm = time.time(), step, True
+            if (args.auto_decay and decay_start is None and pace_warm
+                    and step - pace_step0 >= 50):
                 pace = (time.time() - pace_t0) / (step - pace_step0)
                 if deadline - time.time() <= args.decay_steps * pace * 1.05:
                     local |= 1 << 1

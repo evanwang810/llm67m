@@ -603,7 +603,7 @@ def main() -> None:
     # several times slower than the run really is, and at 4GB for a medium
     # checkpoint that was enough to start the decay with most of a session
     # still left. Amortised over the session, saves cost what they really cost.
-    pace_t0, pace_step0 = time.time(), step
+    pace_t0, pace_step0, pace_warm = time.time(), step, False
     lr = lr_at(step, args, decay_start)  # so the final status is valid even if we break at once
     val_loss: float | None = None
     stop_reason = ""
@@ -647,7 +647,14 @@ def main() -> None:
         if args.max_steps and step >= args.max_steps:
             flags[2] = 1
             stop_reason = stop_reason or "max-steps"
-        if args.auto_decay and decay_start is None and step - pace_step0 >= 50:
+        # The clock restarts once, 20 steps in. The first steps carry the compile,
+        # minutes of it on XLA, and folded into the average that reads as a pace
+        # several times too slow, which with a long cooldown starts the decay at
+        # once and finishes it hours before the deadline.
+        if not pace_warm and step - pace_step0 >= 20:
+            pace_t0, pace_step0, pace_warm = time.time(), step, True
+        if (args.auto_decay and decay_start is None and pace_warm
+                and step - pace_step0 >= 50):
             pace = (time.time() - pace_t0) / (step - pace_step0)
             if deadline - time.time() <= args.decay_steps * pace * 1.05:
                 flags[1] = 1
