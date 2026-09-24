@@ -94,6 +94,7 @@ def _mp_fn(index, args):  # noqa: ARG001
 
     optimizer = model.configure_optimizer(args.lr, args.weight_decay, (0.9, 0.95), "xla")
 
+    base_ft.size_batch(args, sum(p.numel() for p in model.parameters()))
     per_step = args.batch_size * args.grad_accum * world
     steps_per_epoch = max(1, n // per_step)
     total_steps = max(1, int(steps_per_epoch * args.epochs))

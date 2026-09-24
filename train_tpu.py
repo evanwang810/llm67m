@@ -188,7 +188,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             quiet.close()
         step = int(ckpt["step"])
         tokens_seen = int(ckpt.get("tokens_seen", 0))
-        decay_start = ckpt.get("decay_start")
+        decay_start = None if args.reset_decay else ckpt.get("decay_start")
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")
         resume_optimizer = ckpt["optimizer"] if has_optim else None
@@ -261,6 +261,9 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     last_log_step = step
     secs_per_step = 0.0
     start_step = step
+    # See train.py: the decay trigger wants the session pace, not the last
+    # interval, or one checkpoint write reads as a slowdown and ends the run.
+    pace_t0, pace_step0 = time.time(), step
     lr = quantized_lr(step, args, decay_start)
     val_loss: float | None = None
     stop_reason = ""
@@ -315,8 +318,9 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             if args.max_steps and step >= args.max_steps:
                 local |= 1 << 2
                 stop_reason = stop_reason or "max-steps"
-            if args.auto_decay and decay_start is None and secs_per_step > 0:
-                if deadline - time.time() <= args.decay_steps * secs_per_step * 1.05:
+            if args.auto_decay and decay_start is None and step - pace_step0 >= 50:
+                pace = (time.time() - pace_t0) / (step - pace_step0)
+                if deadline - time.time() <= args.decay_steps * pace * 1.05:
                     local |= 1 << 1
             flags = X.mesh_reduce("ctl", local, lambda vs: int(np.bitwise_or.reduce(vs)))
             force_save = bool(flags & 1) or bool(flags & 8)

@@ -80,6 +80,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mode", choices=("train", "tokenize"), default="train")
     p.add_argument("--mount", action="append", default=[],
                    help="extra kernel to mount, user/slug, repeatable")
+    p.add_argument("--no-decay", action="store_true",
+                   help="no LR decay at the end, for every session but the last")
+    p.add_argument("--reset-decay", action="store_true",
+                   help="resume past a decay stored in the checkpoint")
     p.add_argument("--public", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="write the folder, do not push")
     return p.parse_args()
@@ -104,6 +108,10 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         slug = args.slug or f"llm67m-{args.preset}-s{args.session}"
         cmd = ["bash", "kaggle_run.sh", str(args.hours), args.preset, args.tokens]
         env = {"DEVICE": args.device, "MONITOR": "1"}
+        if args.no_decay:
+            env["DECAY"] = "0"
+        if args.reset_decay:
+            env["RESET_DECAY"] = "1"
         if args.sft_hours > 0:
             env["SFT_HOURS"] = str(args.sft_hours)
             env["SFT_DATA"] = args.sft_data

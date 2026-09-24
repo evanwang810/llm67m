@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sft-hours", type=float, default=1.0)
     p.add_argument("--no-tokenize", action="store_true",
                    help="skip the tokenize kernel, the corpus already exists")
+    p.add_argument("--reset-decay-at", type=int, action="append", default=[],
+                   help="session number that resumes past a stored decay")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -107,6 +109,13 @@ def push(args, session: int, mount: str = "") -> int:
         cmd += ["--mount", mount]
     if session > 1:
         cmd += ["--resume", f"{args.user}/llm67m-{args.preset}-s{session - 1}"]
+    # Only the final session decays. Decaying at the end of an earlier one
+    # marks the run finished, and every later session resumes a model that is
+    # already done and trains nothing, which is how two sessions got spent.
+    if session < args.sessions:
+        cmd += ["--no-decay"]
+    if session in args.reset_decay_at:
+        cmd += ["--reset-decay"]
     if session == args.sessions and args.sft_hours > 0:
         cmd += ["--sft-hours", str(args.sft_hours)]
     if args.dry_run:

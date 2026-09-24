@@ -136,10 +136,13 @@ if still_needed > free_gb:
 PY
 
 read -r TRAIN_HOURS DECAY_STEPS MILESTONE_MIN <<EOF
-$(python - "$HOURS" <<'PY'
+$(python - "$HOURS" "${SFT_HOURS:-0}" <<'PY'
 import sys
-hours = float(sys.argv[1])
-train = max(0.4, hours - 0.45)
+hours, sft = float(sys.argv[1]), float(sys.argv[2] or 0)
+# Tuning runs inside the same session, so its hours come out of training's.
+# Without this a final session planned 8.05h of training plus the tuning on
+# top, and Kaggle ends a TPU session at 9h regardless.
+train = max(0.4, hours - 0.45 - sft)
 print(f"{train:.2f} {max(200, int(120 * train))} {max(15, int(train * 60 / 8))}")
 PY
 )
@@ -204,16 +207,25 @@ echo "=== training ${TRAIN_HOURS}h on ${DEVICE}, decay ${DECAY_STEPS} steps, "\
 START_TS="$(date +%s)"
 DEADLINE_SECONDS="$(python -c "print(int($TRAIN_HOURS * 3600))")"
 
+# DECAY=0 for every session of a multi session run except the last. Decaying
+# at the end of each session marks the run finished, and the next session
+# resumes a model that is already done and trains nothing.
+# RESET_DECAY=1 picks a run back up after it decayed too early.
+DECAY_FLAGS=()
+if [ "${DECAY:-1}" != "0" ]; then DECAY_FLAGS+=(--auto-decay); fi
+if [ "${RESET_DECAY:-0}" = "1" ]; then DECAY_FLAGS+=(--reset-decay); fi
+
 TRAIN_CMD=("${LAUNCH[@]}" "$TRAIN_SCRIPT"
   --preset "$PRESET"
   --data-dir "$TOKENS"
   --run-dir "$RUN"
   --deadline-hours "$TRAIN_HOURS"
   --session-start "$START_TS"
-  --auto-decay --decay-steps "$DECAY_STEPS"
+  --decay-steps "$DECAY_STEPS"
   --keep-checkpoints 1 --keep-weights "${KEEP_WEIGHTS:-0}"
   --save-every-min "${SAVE_EVERY_MIN:-12}"
-  --milestone-every-min "$MILESTONE_MIN")
+  --milestone-every-min "$MILESTONE_MIN"
+  "${DECAY_FLAGS[@]}")
 
 if [ -n "${MICRO_BATCH:-}" ]; then TRAIN_CMD+=(--micro-batch "$MICRO_BATCH"); fi
 if [ -n "${GRAD_ACCUM:-}" ]; then TRAIN_CMD+=(--grad-accum "$GRAD_ACCUM"); fi

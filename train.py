@@ -83,6 +83,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--weight-decay", type=float, default=t.weight_decay)
     g.add_argument("--grad-clip", type=float, default=t.grad_clip)
     g.add_argument("--decay", action="store_true", help="enter the WSD decay phase immediately")
+    g.add_argument("--reset-decay", action="store_true",
+                   help="forget a decay phase stored in the resumed checkpoint and keep "
+                        "training at full LR, for extending a run that ended too early")
     g.add_argument("--auto-decay", action="store_true",
                    help="start decaying automatically so it finishes right before the deadline")
     g.add_argument("--max-steps", type=int, default=0, help="0 means run until the deadline")
@@ -530,7 +533,7 @@ def main() -> None:
         ckpt, has_optim = load_resume(info, model, args, fingerprint)
         step = int(ckpt["step"])
         tokens_seen = int(ckpt.get("tokens_seen", step * tokens_per_step))
-        decay_start = ckpt.get("decay_start")
+        decay_start = None if args.reset_decay else ckpt.get("decay_start")
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")  # keeps the smoothed curve continuous across restarts
         if has_optim:
@@ -584,6 +587,12 @@ def main() -> None:
     last_log_t = time.time()
     last_log_step = step
     secs_per_step = 0.0
+    # The decay trigger uses the pace over the whole session, not over the last
+    # log interval. One interval that contains a checkpoint write reads as
+    # several times slower than the run really is, and at 4GB for a medium
+    # checkpoint that was enough to start the decay with most of a session
+    # still left. Amortised over the session, saves cost what they really cost.
+    pace_t0, pace_step0 = time.time(), step
     lr = lr_at(step, args, decay_start)  # so the final status is valid even if we break at once
     val_loss: float | None = None
     stop_reason = ""
@@ -627,8 +636,9 @@ def main() -> None:
         if args.max_steps and step >= args.max_steps:
             flags[2] = 1
             stop_reason = stop_reason or "max-steps"
-        if args.auto_decay and decay_start is None and secs_per_step > 0:
-            if deadline - time.time() <= args.decay_steps * secs_per_step * 1.05:
+        if args.auto_decay and decay_start is None and step - pace_step0 >= 50:
+            pace = (time.time() - pace_t0) / (step - pace_step0)
+            if deadline - time.time() <= args.decay_steps * pace * 1.05:
                 flags[1] = 1
         if ddp:
             dist.all_reduce(flags, op=dist.ReduceOp.MAX)

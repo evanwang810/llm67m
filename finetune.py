@@ -75,8 +75,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-examples", type=int, default=250_000,
                    help="cap on the assembled mix, 0 means no cap")
     p.add_argument("--max-len", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--grad-accum", type=int, default=2)
+    p.add_argument("--batch-size", type=int, default=0,
+                   help="sequences per micro batch per device, 0 sizes it to the model")
+    p.add_argument("--grad-accum", type=int, default=0,
+                   help="0 keeps 32 sequences per optimizer step per device")
     p.add_argument("--epochs", type=float, default=1.0)
     p.add_argument("--hours", type=float, default=0.5, help="hard stop, saves first")
     p.add_argument("--lr", type=float, default=5e-5)
@@ -86,6 +88,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--seed", type=int, default=1337)
     return p.parse_args()
+
+
+def size_batch(args, params: int) -> None:
+    """Fill in batch size and accumulation when they were left at 0.
+
+    Sixteen sequences of 512 suited the 173M model. The medium one carries three
+    times the weights and Adam state, and at sixteen the compiled program
+    asked a TPU core for 9.18G when 8.9G was left, so the micro batch shrinks
+    with the model and accumulation makes up the difference. Sequences per
+    optimizer step stay at 32 either way, so the tuning itself is unchanged.
+    """
+    if not args.batch_size:
+        args.batch_size = 16 if params < 250e6 else 8 if params < 600e6 else 4
+    if not args.grad_accum:
+        args.grad_accum = max(1, 32 // args.batch_size)
+    print(f"micro batch {args.batch_size} x accumulation {args.grad_accum} "
+          f"for {params / 1e6:.0f}M parameters")
 
 
 def find_base(args) -> Path:
@@ -287,6 +306,7 @@ def main() -> None:
     print(f"pretrained for {base_step:,} steps\n")
     del ckpt
 
+    size_batch(args, sum(p.numel() for p in model.parameters()))
     xs, ys = build_dataset(args, enc)
     n = len(xs)
     tokens_per_step = args.batch_size * args.grad_accum * (args.max_len - 1)
