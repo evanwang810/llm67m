@@ -38,6 +38,17 @@ MISSING = "missing"
 WEEK = timedelta(days=7)
 
 
+def quota_week_start(now: datetime, weekday: int) -> datetime:
+    """The most recent quota reset at or before now, at 00:00 UTC.
+
+    Kaggle resets the weekly allowance at a fixed time, Saturday 00:00 UTC, not
+    on a rolling seven days. Pacing against a rolling window held a session
+    back for most of a week while the whole allowance sat unused.
+    """
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=(now.weekday() - weekday) % 7)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -55,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=2, help="extra attempts per session")
     p.add_argument("--tpu-quota-hours", type=float, default=20.0,
                    help="weekly TPU allowance; sessions are paced to stay under it")
+    p.add_argument("--quota-reset-weekday", type=int, default=5,
+                   help="day Kaggle resets the quota, Monday=0; Kaggle uses Saturday")
     p.add_argument("--decay-fraction", type=float, default=0.75,
                    help="share of the final session spent decaying the LR")
     p.add_argument("--no-tokenize", action="store_true",
@@ -245,6 +258,7 @@ def main() -> None:
             raise SystemExit(f"seed {args.seed_from} ended as {st}, not starting on it")
 
     now = datetime.now(timezone.utc)
+    week_start = quota_week_start(now, args.quota_reset_weekday)
     window_used = 0.0
     previous = args.seed_from
 
@@ -253,14 +267,18 @@ def main() -> None:
         states = {a: status_of(a) for a in attempts}
         done = next((a for a in attempts if states[a] == "complete"), None)
 
-        # Quota spent inside the last week, counted as we pass each session.
-        # The window runs an extra session length back, because a session that
-        # finished just inside it may have started just outside and still used
-        # hours that count against this week.
+        # Quota spent since this week's reset, counted as we pass each session.
+        # lastRunTime is when an attempt started running, so a session that
+        # began before the reset and ran across it only counts for the part
+        # after it, which is how Kaggle charges it.
         for a in attempts:
-            when = have.get(a)
-            if when and now - when <= WEEK + timedelta(hours=args.hours):
-                window_used += hours_used(a, states[a], args.hours)
+            start = have.get(a)
+            if not start or start + timedelta(hours=args.hours + 1) < week_start:
+                continue
+            used = hours_used(a, states[a], args.hours)
+            end = start + timedelta(hours=used)
+            if end > week_start:
+                window_used += (end - max(start, week_start)).total_seconds() / 3600
 
         if done:
             print(f"session {session}: complete as {done}")
@@ -286,8 +304,9 @@ def main() -> None:
                     f"tick starts the session again.")
 
         if args.device == "tpu" and window_used + args.hours > args.tpu_quota_hours:
-            print(f"waiting on quota: {window_used:.1f}h of TPU used in the last week, "
-                  f"another {args.hours}h session would pass {args.tpu_quota_hours}h")
+            print(f"waiting on quota: {window_used:.1f}h of TPU used since the reset on "
+                  f"{week_start:%a %b %d}, another {args.hours}h session would pass "
+                  f"{args.tpu_quota_hours}h")
             return
 
         slug = attempt_ids(args, session)[len(attempts)].split("/", 1)[1]
