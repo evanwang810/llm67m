@@ -228,6 +228,20 @@ DECAY_FLAGS=()
 if [ "${DECAY:-1}" != "0" ]; then DECAY_FLAGS+=(--auto-decay); fi
 if [ "${RESET_DECAY:-0}" = "1" ]; then DECAY_FLAGS+=(--reset-decay); fi
 
+# How often to write a full checkpoint. On the TPU VM, /kaggle/working sits on
+# a disk that sustains about 10MB/s once the page cache is full, and a medium
+# checkpoint with its Adam state is 4.25GB, so each save takes around seven
+# minutes to flush. At the old 12 minute interval the flushes never caught up,
+# Linux throttled every writer on the machine including the trainer's own log
+# lines, and 3.5 hours of each 8 hour session went to waiting on the disk. An
+# hour apart, each flush finishes long before the next one starts. A crash
+# costs at most that hour: the retry loop below resumes from the last save.
+if [ "$DEVICE" = "tpu" ]; then
+  SAVE_EVERY_MIN="${SAVE_EVERY_MIN:-60}"
+else
+  SAVE_EVERY_MIN="${SAVE_EVERY_MIN:-12}"
+fi
+
 TRAIN_CMD=("${LAUNCH[@]}" "$TRAIN_SCRIPT"
   --preset "$PRESET"
   --data-dir "$TOKENS"
@@ -236,7 +250,7 @@ TRAIN_CMD=("${LAUNCH[@]}" "$TRAIN_SCRIPT"
   --session-start "$START_TS"
   --decay-steps "$DECAY_STEPS"
   --keep-checkpoints 1 --keep-weights "${KEEP_WEIGHTS:-0}"
-  --save-every-min "${SAVE_EVERY_MIN:-12}"
+  --save-every-min "$SAVE_EVERY_MIN"
   --milestone-every-min "$MILESTONE_MIN"
   "${DECAY_FLAGS[@]}")
 
