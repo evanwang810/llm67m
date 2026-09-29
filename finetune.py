@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def size_batch(args, params: int) -> None:
+def size_batch(args, params: int, verbose: bool = True) -> None:
     """Fill in batch size and accumulation when they were left at 0.
 
     Sixteen sequences of 512 suited the 173M model. The medium one carries three
@@ -103,8 +103,9 @@ def size_batch(args, params: int) -> None:
         args.batch_size = 16 if params < 250e6 else 8 if params < 600e6 else 4
     if not args.grad_accum:
         args.grad_accum = max(1, 32 // args.batch_size)
-    print(f"micro batch {args.batch_size} x accumulation {args.grad_accum} "
-          f"for {params / 1e6:.0f}M parameters")
+    if verbose:
+        print(f"micro batch {args.batch_size} x accumulation {args.grad_accum} "
+              f"for {params / 1e6:.0f}M parameters")
 
 
 def find_base(args) -> Path:
@@ -347,13 +348,16 @@ def main() -> None:
     print("finetuning\n")
     started = time.time()
     for step in range(hard_cap):
-        if step == 30:
+        if step == 10:
+            t10 = time.time()
+        if step == 40:
             # Refit the schedule to the time actually available. Cutting a cosine
-            # off at 20% leaves the model parked at a high learning rate, which
-            # undoes a good part of what the tuning was for; better to decay
-            # over the steps that will really happen.
-            rate = (time.time() - started) / 30
-            fits = int((deadline - started) / rate)
+            # off partway leaves the model parked at a high learning rate, which
+            # undoes much of what the tuning was for. The rate is measured from step
+            # 10, after the compile: timed from step 0 it read 7.9 s/step on a TPU
+            # that runs 0.72, and cut a tuning budget to a tenth of what fitted.
+            rate = (time.time() - t10) / 30
+            fits = step + int((deadline - time.time()) / rate)
             if fits < total_steps:
                 total_steps = max(args.warmup + 10, fits)
                 print(f"schedule refit to {total_steps:,} steps to finish in "

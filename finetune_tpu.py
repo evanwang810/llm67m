@@ -94,7 +94,7 @@ def _mp_fn(index, args):  # noqa: ARG001
 
     optimizer = model.configure_optimizer(args.lr, args.weight_decay, (0.9, 0.95), "xla")
 
-    base_ft.size_batch(args, sum(p.numel() for p in model.parameters()))
+    base_ft.size_batch(args, sum(p.numel() for p in model.parameters()), verbose=master)
     per_step = args.batch_size * args.grad_accum * world
     steps_per_epoch = max(1, n // per_step)
     total_steps = max(1, int(steps_per_epoch * args.epochs))
@@ -141,14 +141,18 @@ def _mp_fn(index, args):  # noqa: ARG001
     hard_cap = total_steps
     started = time.time()
     for step in range(hard_cap):
-        if step == 30:
-            # Refit the cosine to the time actually available: cutting it off
-            # partway leaves the model parked at a high learning rate, which
-            # undoes much of what the tuning was for. Replicas do not agree on
-            # their own clocks, so the fitted length comes from replica zero
-            # through a collective rather than from each replica separately.
-            rate = (time.time() - started) / 30
-            fits = int((deadline - started) / rate) if master else 0
+        if step == 10:
+            t10 = time.time()
+        if step == 40:
+            # Refit the schedule to the time actually available. Cutting a cosine
+            # off partway leaves the model parked at a high learning rate, which
+            # undoes much of what the tuning was for. The rate is measured from step
+            # 10, after the compile: timed from step 0 it read 7.9 s/step on a TPU
+            # that runs 0.72, and cut a tuning budget to a tenth of what fitted.
+            # Replicas do not agree on their own clocks, so the fitted length
+            # comes from replica zero through a collective.
+            rate = (time.time() - t10) / 30
+            fits = step + int((deadline - time.time()) / rate) if master else 0
             fits = X.mesh_reduce("sft-fit", fits, max)
             if fits < total_steps:
                 total_steps = max(args.warmup + 10, fits)

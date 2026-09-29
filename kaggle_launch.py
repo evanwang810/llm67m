@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default="", help="tokens dataset, user/slug")
     p.add_argument("--resume", default="",
                    help="previous session's kernel, user/slug, mounted for its checkpoint")
-    p.add_argument("--mode", choices=("train", "tokenize"), default="train")
+    p.add_argument("--mode", choices=("train", "tokenize", "sft"), default="train")
     p.add_argument("--mount", action="append", default=[],
                    help="extra kernel to mount, user/slug, repeatable")
     p.add_argument("--no-decay", action="store_true",
@@ -106,6 +106,18 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
                f"--max-tokens {args.tokens}"]
         env = {}
         device = "none"
+    elif args.mode == "sft":
+        # Instruction tuning alone, on whatever checkpoint the mounted kernels
+        # hold: no preflight, no pretraining. finetune picks the newest
+        # non-SFT checkpoint under /kaggle/input by itself.
+        slug = args.slug or f"llm67m-{args.preset}-sft"
+        script = "finetune_tpu.py" if args.device == "tpu" else "finetune.py"
+        cmd = ["bash", "-c",
+               "pip install -q tiktoken datasets && "
+               f"python {script} --run-dir /kaggle/working/run "
+               f"--hours {args.sft_hours or 0.5} --dataset {args.sft_data}"]
+        env = {}
+        device = args.device
     else:
         slug = args.slug or f"llm67m-{args.preset}-s{args.session}"
         cmd = ["bash", "kaggle_run.sh", str(args.hours), args.preset, args.tokens]
