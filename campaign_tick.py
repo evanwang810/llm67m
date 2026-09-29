@@ -66,6 +66,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=2, help="extra attempts per session")
     p.add_argument("--tpu-quota-hours", type=float, default=20.0,
                    help="weekly TPU allowance; sessions are paced to stay under it")
+    p.add_argument("--preview-after", type=int, default=0,
+                   help="after this session, tune a chat preview of its checkpoint; 0 is off")
+    p.add_argument("--preview-hours", type=float, default=0.5)
     p.add_argument("--quota-reset-weekday", type=int, default=5,
                    help="day Kaggle resets the quota, Monday=0; Kaggle uses Saturday")
     p.add_argument("--decay-fraction", type=float, default=0.75,
@@ -259,26 +262,33 @@ def main() -> None:
 
     now = datetime.now(timezone.utc)
     week_start = quota_week_start(now, args.quota_reset_weekday)
-    window_used = 0.0
     previous = args.seed_from
+
+    def charge(kernel: str, state: str) -> float:
+        """TPU hours a kernel spent since this week's reset.
+
+        lastRunTime is when it started running, so a kernel that began before
+        the reset and ran across it only counts for the part after, which is
+        how Kaggle charges it.
+        """
+        start = have.get(kernel)
+        if not start or start + timedelta(hours=args.hours + 1) < week_start:
+            return 0.0
+        end = start + timedelta(hours=hours_used(kernel, state, args.hours))
+        return max(0.0, (end - max(start, week_start)).total_seconds() / 3600)
+
+    preview_id = (f"{args.user}/{args.name}-preview-s{args.preview_after}"
+                  if args.preview_after else "")
+    preview_state = status_of(preview_id) if preview_id in have else MISSING
+    window_used = charge(preview_id, preview_state) if preview_state != MISSING else 0.0
 
     for session in range(1, args.sessions + 1):
         attempts = [a for a in attempt_ids(args, session) if a in have]
         states = {a: status_of(a) for a in attempts}
         done = next((a for a in attempts if states[a] == "complete"), None)
 
-        # Quota spent since this week's reset, counted as we pass each session.
-        # lastRunTime is when an attempt started running, so a session that
-        # began before the reset and ran across it only counts for the part
-        # after it, which is how Kaggle charges it.
         for a in attempts:
-            start = have.get(a)
-            if not start or start + timedelta(hours=args.hours + 1) < week_start:
-                continue
-            used = hours_used(a, states[a], args.hours)
-            end = start + timedelta(hours=used)
-            if end > week_start:
-                window_used += (end - max(start, week_start)).total_seconds() / 3600
+            window_used += charge(a, states[a])
 
         if done:
             print(f"session {session}: complete as {done}")
@@ -302,6 +312,26 @@ def main() -> None:
                     f"session {session} failed {len(attempts)} times; that is a bug, "
                     f"not bad luck. Fix it, delete the failed kernels, and the next "
                     f"tick starts the session again.")
+
+        # A chat preview of a mid-training checkpoint. It goes after session N
+        # because the next session usually waits on the weekly reset there
+        # anyway, so it costs the campaign nothing; Kaggle allows one batch TPU
+        # session at a time, so while it runs the campaign waits. A preview that
+        # fails does not hold the campaign up.
+        if preview_id and session == args.preview_after + 1 and not attempts:
+            if preview_state in ("running", "queued"):
+                print(f"preview {preview_id} is {preview_state} and holds the TPU slot")
+                return
+            if (preview_state == MISSING
+                    and window_used + args.preview_hours <= args.tpu_quota_hours):
+                print(f"pushing the SFT preview {preview_id}, tuned from {previous}",
+                      flush=True)
+                cmd = launcher() + [
+                    "--user", args.user, "--mode", "sft",
+                    "--slug", preview_id.split("/", 1)[1], "--preset", args.preset,
+                    "--device", args.device, "--sft-hours", str(args.preview_hours),
+                    "--mount", previous]
+                raise SystemExit(run(cmd + (["--dry-run"] if args.dry_run else [])))
 
         if args.device == "tpu" and window_used + args.hours > args.tpu_quota_hours:
             print(f"waiting on quota: {window_used:.1f}h of TPU used since the reset on "
