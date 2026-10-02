@@ -20,6 +20,7 @@ Commands inside the session:
     /greedy           toggle argmax sampling
     /probs            toggle the per-token probability table
     /history 0        previous turns to carry, 0 for a single-turn tuned model
+    /rep 1.1          repetition penalty, 1 turns it off
     /stats            what this session has generated so far
     /reset            clear the conversation
     /help  /quit
@@ -37,7 +38,7 @@ import torch
 import torch.nn.functional as F
 
 import chatui as ui
-from model import load_model_from_checkpoint
+from model import KVCache, load_model_from_checkpoint
 from runstate import default_search_dirs, find_checkpoints
 
 USER_TOKEN = 50257
@@ -66,11 +67,16 @@ class Settings:
     # How many previous exchanges to put in front of the question. Zero for an
     # Alpaca-tuned model on purpose: see Session.build_prompt.
     history: int = 0
+    # Above 1, tokens the model already used in this reply or its recent answers
+    # get less likely. A small model's favourite failure is copying its own
+    # previous answer back out, or looping on one sentence.
+    rep: float = 1.1
 
     def summary(self) -> str:
         mode = "greedy" if self.greedy else f"temp {self.temp:g} · top-k {self.topk}"
         hist = "no history" if self.history == 0 else f"{self.history} turns of history"
-        return f"{mode} · max {self.tokens} tok · {hist}"
+        rep = "" if self.rep == 1 else f" · rep {self.rep:g}"
+        return f"{mode}{rep} · max {self.tokens} tok · {hist}"
 
 
 @dataclass
@@ -141,11 +147,31 @@ def checkpoint_menu(search_dirs) -> Path | None:
 # --------------------------------------------------------------------------- #
 
 
+def resolve_device(name: str) -> str:
+    """auto picks a CUDA GPU if there is one, otherwise the CPU.
+
+    Not an Intel integrated GPU, measured: with the cache it holds steady
+    memory, but generating one token at a time is hundreds of tiny kernels per
+    token, and an Arc 130V ran 2.2 to 2.9 tok/s against the same laptop's CPU
+    at 6.4. Ask for xpu explicitly to use it anyway.
+    """
+    if name != "auto":
+        return name
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 class Session:
     def __init__(self, path: Path, device: str) -> None:
-        print(ui.dim(f"loading {path.name} ..."), flush=True)
+        device = resolve_device(device)
+        print(ui.dim(f"loading {path.name} on {device} ..."), flush=True)
         t0 = time.time()
         self.model, ckpt = load_model_from_checkpoint(path, device=device)
+        if device != "cpu":
+            # Generation reads every weight once per token, so halving their
+            # size roughly doubles the speed. A laptop CPU has no fast bf16, so
+            # it keeps fp32.
+            self.model = self.model.to(torch.bfloat16)
+        self.dtype = next(self.model.parameters()).dtype
         self.load_s = time.time() - t0
         self.device = torch.device(device)
         self.path = path
@@ -203,20 +229,45 @@ class Session:
     @torch.no_grad()
     def reply(self, message: str, max_tokens: int, temperature: float,
               top_k: int, greedy: bool, show_probs: bool,
-              stream: bool = True, turns: int = 0) -> str:
-        ids = self.build_prompt(message, turns)[-(self.model.cfg.block_size - 1):]
+              stream: bool = True, turns: int = 0, rep: float = 1.0) -> str:
+        block = self.model.cfg.block_size
+        max_tokens = min(max_tokens, block // 2)
+        # Leave room for the reply: with a cache the context cannot slide, so a
+        # long conversation drops its oldest tokens up front instead.
+        ids = self.build_prompt(message, turns)[-(block - max_tokens):]
         self.last_ctx = len(ids)
-        idx = torch.tensor([ids], dtype=torch.long, device=self.device)
         out_parts: list[str] = []
         rows = []
         streamer = ui.Streamer(indent=2, code=ui.BOT_CODE) if stream else None
 
+        # Tokens the repetition penalty applies to: the recent answers this
+        # prompt carries, then everything this reply says as it goes. Not the
+        # user's words, which a good answer is supposed to reuse.
+        seen: set[int] = set()
+        if rep != 1 and turns > 0:
+            for role, content in self.history[-2 * turns:]:
+                if role == "assistant":
+                    seen.update(self.enc.encode_ordinary(content))
+
+        cache = KVCache(self.model.cfg, 1, self.device, self.dtype)
+        # The prompt goes through once, padded to a multiple of 64 on a GPU so
+        # there are only a handful of prompt shapes ever. The padded tail writes
+        # junk keys past the prompt; the cache mask keeps them out of view and
+        # generation overwrites them in order.
+        n = len(ids)
+        padded = n if self.device.type == "cpu" else min(block, -(-n // 64) * 64)
+        prompt = torch.zeros((1, padded), dtype=torch.long, device=self.device)
+        prompt[0, :n] = torch.tensor(ids, dtype=torch.long)
+
         t0 = time.time()
         first_token_s = None
+        logits = self.model.step(prompt, cache, 0)[0, n - 1].float()
+        pos = n
         for _ in range(max_tokens):
-            window = idx[:, -self.model.cfg.block_size:]
-            logits, _ = self.model(window)
-            logits = logits[0, -1].float()
+            if seen:
+                hit = torch.tensor(sorted(seen), device=logits.device)
+                lg = logits[hit]
+                logits[hit] = torch.where(lg > 0, lg / rep, lg * rep)
             probs_full = F.softmax(logits, dim=-1)
 
             if greedy:
@@ -234,6 +285,8 @@ class Session:
                 break
             piece = self.enc.decode([nxt])
             out_parts.append(piece)
+            if rep != 1:
+                seen.add(nxt)
             if streamer:
                 streamer.feed(piece)
             if show_probs:
@@ -241,7 +294,11 @@ class Session:
                 rows.append((piece, float(probs_full[nxt]),
                              [(self.enc.decode([int(t)]), float(p))
                               for p, t in zip(top_p, top_i)]))
-            idx = torch.cat([idx, torch.tensor([[nxt]], device=self.device)], dim=1)
+            if pos >= block:
+                break
+            step_in = torch.tensor([[nxt]], dtype=torch.long, device=self.device)
+            logits = self.model.step(step_in, cache, pos)[0, -1].float()
+            pos += 1
 
         elapsed = time.time() - t0
         if streamer:
@@ -355,7 +412,8 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model", default="", help="path to a .pt checkpoint")
     p.add_argument("--dir", default="", help="folder to search for checkpoints")
-    p.add_argument("--device", default="cpu", help="cpu or cuda")
+    p.add_argument("--device", default="auto", help="auto, cpu, cuda or xpu")
+    p.add_argument("--rep", type=float, default=1.1, help="repetition penalty, 1 is off")
     p.add_argument("--tokens", type=int, default=128)
     p.add_argument("--temp", type=float, default=0.8)
     p.add_argument("--topk", type=int, default=40)
@@ -381,6 +439,7 @@ def main() -> None:
 
     session = Session(path, args.device)
     settings = Settings(args.tokens, args.temp, args.topk, args.greedy, args.probs)
+    settings.rep = max(1.0, args.rep)
     settings.history = (args.history if args.history >= 0
                         else (4 if session.multi_turn else 0))
     print()
@@ -428,6 +487,12 @@ def main() -> None:
             elif cmd == "/probs":
                 settings.probs = not settings.probs
                 print(ui.dim(f"  probs = {settings.probs}"))
+            elif cmd == "/rep":
+                try:
+                    settings.rep = max(1.0, float(arg))
+                    print(ui.dim(f"  repetition penalty {settings.rep:g}"))
+                except ValueError:
+                    print(ui.bad(f"  usage: /rep <x>   (currently {settings.rep:g}, 1 is off)"))
             elif cmd == "/history":
                 try:
                     settings.history = max(0, int(arg))
@@ -452,7 +517,8 @@ def main() -> None:
         print(ui.chip(label, ui.BOT_CODE_N))
         try:
             session.reply(line, settings.tokens, settings.temp, settings.topk,
-                          settings.greedy, settings.probs, turns=settings.history)
+                          settings.greedy, settings.probs, turns=settings.history,
+                          rep=settings.rep)
         except KeyboardInterrupt:
             print(ui.dim("\n  stopped"))
 

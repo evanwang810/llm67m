@@ -47,6 +47,29 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return out.to(dtype)
 
 
+class KVCache:
+    """Key and value buffers for generating one token at a time.
+
+    Without a cache every new token reruns the whole conversation through the
+    model, so a reply slows down as the chat grows: 37 seconds for a first
+    answer on a laptop CPU, four and a half minutes three turns later. With one,
+    each step runs only the new token against the stored keys and values.
+
+    The buffers are allocated at the full block size up front rather than grown
+    by concatenation. That keeps every decoding step the same shape, which is
+    what an Intel GPU needs: there each new tensor shape caches its own memory
+    and kernels, and shapes that change every token grow without bound.
+    """
+
+    def __init__(self, cfg: GPTConfig, batch: int, device, dtype) -> None:
+        shape = (cfg.n_layer, batch, cfg.n_head, cfg.block_size, cfg.head_dim)
+        self.k = torch.zeros(shape, device=device, dtype=dtype)
+        self.v = torch.zeros(shape, device=device, dtype=dtype)
+        self.size = cfg.block_size
+        key_pos = torch.arange(cfg.block_size, device=device)
+        self.key_pos = key_pos[None, None, None, :]
+
+
 class Attention(nn.Module):
     def __init__(self, cfg: GPTConfig) -> None:
         super().__init__()
@@ -56,7 +79,8 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
 
-    def forward(self, x: torch.Tensor, cos, sin, kv_cache=None):
+    def forward(self, x: torch.Tensor, cos, sin, cache: KVCache | None = None,
+                layer: int = 0, pos: int = 0):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
@@ -64,6 +88,19 @@ class Attention(nn.Module):
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+        if cache is not None:
+            # Write this chunk's keys and values at its positions, then attend
+            # over the whole buffer with a mask: a query at position p sees keys
+            # 0..p. Slots past the current position hold stale or padding values,
+            # and the mask keeps them out until they are overwritten, which
+            # always happens before they come into view.
+            cache.k[layer, :, :, pos:pos + T] = k
+            cache.v[layer, :, :, pos:pos + T] = v
+            query_pos = torch.arange(pos, pos + T, device=x.device)[None, None, :, None]
+            mask = cache.key_pos <= query_pos
+            y = F.scaled_dot_product_attention(q, cache.k[layer], cache.v[layer], attn_mask=mask)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
+            return self.proj(y)
         # On Turing (T4) SDPA falls back to the memory-efficient or math kernel.
         # Flash attention needs sm80+, so do not expect it here.
         y = F.scaled_dot_product_attention(
@@ -92,8 +129,9 @@ class Block(nn.Module):
         self.norm2 = RMSNorm(cfg.n_embd)
         self.mlp = MLP(cfg)
 
-    def forward(self, x: torch.Tensor, cos, sin) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), cos, sin)
+    def forward(self, x: torch.Tensor, cos, sin, cache: KVCache | None = None,
+                layer: int = 0, pos: int = 0) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x), cos, sin, cache, layer, pos)
         return x + self.mlp(self.norm2(x))
 
 
@@ -169,6 +207,22 @@ class GPT(nn.Module):
             logits.view(-1, logits.size(-1)).float(), targets.reshape(-1), ignore_index=-1
         )
         return logits, loss
+
+    @torch.no_grad()
+    def step(self, idx: torch.Tensor, cache: KVCache, pos: int) -> torch.Tensor:
+        """Logits for every position of idx, which starts at position pos.
+
+        For generation with a KVCache: call it once with the prompt at pos 0,
+        then once per new token. Training never goes through here.
+        """
+        T = idx.size(1)
+        if pos + T > self.cfg.block_size:
+            raise ValueError(f"position {pos + T} exceeds block_size {self.cfg.block_size}")
+        cos, sin = self.rope_cos[pos:pos + T], self.rope_sin[pos:pos + T]
+        x = self.wte(idx)
+        for i, block in enumerate(self.blocks):
+            x = block(x, cos, sin, cache, i, pos)
+        return self.lm_head(self.norm_f(x))
 
     def param_report(self) -> str:
         counted = sum(p.numel() for p in self.parameters())
