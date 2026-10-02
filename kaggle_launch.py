@@ -73,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tokens", default="7.5e9")
     p.add_argument("--sft-hours", type=float, default=0.0,
                    help="instruction tune after training, 0 to skip")
-    p.add_argument("--sft-data", default="chat-math")
+    p.add_argument("--sft-data", default="assistant")
     p.add_argument("--data", default="", help="tokens dataset, user/slug")
     p.add_argument("--resume", default="",
                    help="previous session's kernel, user/slug, mounted for its checkpoint")

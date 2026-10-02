@@ -74,7 +74,7 @@ def _mp_fn(index, args):  # noqa: ARG001
 
     ckpt = torch.load(_BASE, map_location="cpu", weights_only=False)
     cfg = GPTConfig(**ckpt["config"]["model"])
-    if cfg.vocab_size <= base_ft.ASSISTANT_TOKEN:
+    if cfg.vocab_size <= base_ft.TOOL_RESULT:
         raise SystemExit(f"vocab_size {cfg.vocab_size} has no free slot for turn tokens")
     model = GPT(cfg)
     state = strip_prefixes(ckpt["model"])
@@ -217,6 +217,9 @@ def _mp_fn(index, args):  # noqa: ARG001
             "config": {"model": cfg.as_dict()},
             "sft": True,
             "user_token": base_ft.USER_TOKEN,
+            "tools": base_ft.HAS_TOOLS,
+            "tool_call_token": base_ft.TOOL_CALL,
+            "tool_result_token": base_ft.TOOL_RESULT,
             "assistant_token": base_ft.ASSISTANT_TOKEN,
             "sft_dataset": args.dataset,
             "base_checkpoint": str(_BASE),

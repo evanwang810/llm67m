@@ -33,6 +33,7 @@ model does not have the capacity for real question answering, so treat this as
 from __future__ import annotations
 
 import argparse
+import random
 import json
 import math
 import os
@@ -45,9 +46,16 @@ import torch
 from model import GPT, strip_prefixes
 from config import GPTConfig
 from runstate import RunDir, default_search_dirs, find_checkpoints
+import tools
 
 USER_TOKEN = 50257
 ASSISTANT_TOKEN = 50258
+# Two more free rows of the padded vocab, for tool use; the format is in tools.py.
+TOOL_CALL = tools.TOOL_CALL
+TOOL_RESULT = tools.TOOL_RESULT
+# Set by build_dataset when the mix contained tool conversations, so the saved
+# checkpoint can tell chat.py to run the tool loop.
+HAS_TOOLS = False
 
 # Shorthands for --dataset. SmolTalk is the one that matters: it was built for
 # SmolLM2, which is the same size class as this model, so its answers are short
@@ -74,10 +82,22 @@ MIXES = {
                  "HuggingFaceTB/smoltalk:metamathqa-50k:1.5,"
                  "HuggingFaceTB/smoltalk:numina-cot-100k:1.5,"
                  "sftdata/identity.jsonl:3",
+    # Everything above plus tool use: searching and answering from the results
+    # (MS MARCO's real queries, web passages and human answers), and handing
+    # arithmetic to a calculator. Names starting with @ are built by tools.py.
+    "assistant": "HuggingFaceTB/smoltalk:everyday-conversations:2,"
+                 "HuggingFaceTB/smoltalk:smol-magpie-ultra:6,"
+                 "HuggingFaceTB/smoltalk:smol-summarize:1,"
+                 "HuggingFaceTB/smoltalk:smol-constraints:1,"
+                 "HuggingFaceTB/smoltalk:metamathqa-50k:1.5,"
+                 "HuggingFaceTB/smoltalk:numina-cot-100k:1.5,"
+                 "@msmarco:1.5,"
+                 "@calc:0.5,"
+                 "sftdata/identity.jsonl:3",
     "alpaca": "yahma/alpaca-cleaned",
     "dolly": "databricks/databricks-dolly-15k",
 }
-DEFAULT_MIX = "chat-math"
+DEFAULT_MIX = "assistant"
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,6 +252,11 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
         share = int(budget * weight / total_weight) if budget else 0
         label = f"{name}" + (f":{config}" if config else "")
         print(f"loading {label}")
+        if name in tools.SPECIAL:
+            made = tools.SPECIAL[name](share or 10_000, random.Random(args.seed))
+            print(f"  {len(made):,} conversations")
+            convos += made
+            continue
         if _local(name):
             path = Path(name) if Path(name).is_absolute() else Path(__file__).parent / name
             with path.open(encoding="utf-8") as f:
@@ -280,6 +305,9 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
     kept = 0
     for turns in convos:
         roles = [r for r, _ in turns if r != "system"]
+        if "call" in roles:
+            global HAS_TOOLS
+            HAS_TOOLS = True
         ids = encoded[cursor : cursor + len(roles)]
         cursor += len(roles)
 
@@ -294,6 +322,16 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
             if role == "user":
                 seq += [USER_TOKEN] + body + [ASSISTANT_TOKEN]
                 supervised += [False] * (len(body) + 2)
+            elif role == "call":
+                # The model writes the call, markers included: closing it with
+                # TOOL_RESULT is what tells the runtime to go and run it.
+                seq += [TOOL_CALL] + body + [TOOL_RESULT]
+                supervised += [True] * (len(body) + 2)
+            elif role == "result":
+                # The tool wrote this, and the runtime hands the turn back with
+                # a fresh ASSISTANT; neither is the model's to predict.
+                seq += body + [ASSISTANT_TOKEN]
+                supervised += [False] * (len(body) + 1)
             else:
                 # The turn-ending eot is supervised too, or nothing ever teaches
                 # the model to stop.
@@ -336,7 +374,7 @@ def main() -> None:
     print(f"base checkpoint: {base}")
     ckpt = torch.load(base, map_location="cpu", weights_only=False)
     cfg = GPTConfig(**ckpt["config"]["model"])
-    if cfg.vocab_size <= ASSISTANT_TOKEN:
+    if cfg.vocab_size <= TOOL_RESULT:
         raise SystemExit(f"vocab_size {cfg.vocab_size} has no free slot for turn tokens")
     model = GPT(cfg)
     state = strip_prefixes(ckpt["model"])
@@ -449,6 +487,9 @@ def main() -> None:
         "sft": True,
         "user_token": USER_TOKEN,
         "assistant_token": ASSISTANT_TOKEN,
+        "tools": HAS_TOOLS,
+        "tool_call_token": TOOL_CALL,
+        "tool_result_token": TOOL_RESULT,
         "sft_dataset": args.dataset,
         "base_checkpoint": str(base),
     }

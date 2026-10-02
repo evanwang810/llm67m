@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 import chatui as ui
+import tools
 from model import KVCache, load_model_from_checkpoint
 from runstate import default_search_dirs, find_checkpoints
 
@@ -178,6 +179,11 @@ class Session:
         self.sft = bool(ckpt.get("sft"))
         self.user_token = ckpt.get("user_token", USER_TOKEN)
         self.assistant_token = ckpt.get("assistant_token", ASSISTANT_TOKEN)
+        # Only a checkpoint tuned on tool conversations knows the call format;
+        # for any other, a stray special token just ends the reply as before.
+        self.tools = bool(ckpt.get("tools"))
+        self.call_token = ckpt.get("tool_call_token", tools.TOOL_CALL)
+        self.result_token = ckpt.get("tool_result_token", tools.TOOL_RESULT)
         self.step = ckpt.get("step", 0)
         # Whether carrying history helps is a property of the tuning data, not
         # of the chat tool: a model tuned only on single turn data reads a
@@ -263,8 +269,23 @@ class Session:
         first_token_s = None
         logits = self.model.step(prompt, cache, 0)[0, n - 1].float()
         pos = n
-        for _ in range(max_tokens):
-            if seen:
+
+        def feed(chunk: list[int]) -> torch.Tensor:
+            """Run tokens through the cache, return the logits after the last."""
+            nonlocal pos
+            t = torch.tensor([chunk], dtype=torch.long, device=self.device)
+            out = self.model.step(t, cache, pos)[0, -1].float()
+            pos += len(chunk)
+            return out
+
+        call_ids: list[int] | None = None  # set while the model is writing a call
+        calls = 0
+        # Room for the calls on top of the answer budget, which counts only
+        # what the user gets to read.
+        for _ in range(max_tokens + 48 * tools.MAX_CALLS):
+            if len(out_parts) >= max_tokens or pos >= block:
+                break
+            if seen and call_ids is None:
                 hit = torch.tensor(sorted(seen), device=logits.device)
                 lg = logits[hit]
                 logits[hit] = torch.where(lg > 0, lg / rep, lg * rep)
@@ -281,6 +302,34 @@ class Session:
 
             if first_token_s is None:
                 first_token_s = time.time() - t0
+
+            if self.tools and nxt == self.call_token and call_ids is None and calls < tools.MAX_CALLS:
+                call_ids = []
+                logits = feed([nxt])
+                continue
+            if call_ids is not None:
+                if nxt != self.result_token and len(call_ids) < 48:
+                    call_ids.append(nxt)
+                    logits = feed([nxt])
+                    continue
+                # The model closed its call: run it, show it, and hand the
+                # output back with a fresh assistant turn to answer from.
+                name, arg, output = tools.run(self.enc.decode(call_ids))
+                calls += 1
+                call_ids = None
+                if streamer and streamer.started:
+                    streamer.done()
+                    streamer = ui.Streamer(indent=2, code=ui.BOT_CODE)
+                if stream:
+                    print(ui.dim(f"  {ui.G['arrow']} {name}: {arg}"))
+                    if show_probs:
+                        print(ui.faint("    " + output.replace("\n", "\n    ")))
+                result = self.enc.encode_ordinary(output)
+                room = block - pos - max(32, max_tokens - len(out_parts)) - 2
+                result = result[:max(0, room)]
+                logits = feed([self.result_token] + result + [self.assistant_token])
+                continue
+
             if nxt == self.enc.eot_token or nxt >= self.enc.n_vocab:
                 break
             piece = self.enc.decode([nxt])
@@ -294,11 +343,7 @@ class Session:
                 rows.append((piece, float(probs_full[nxt]),
                              [(self.enc.decode([int(t)]), float(p))
                               for p, t in zip(top_p, top_i)]))
-            if pos >= block:
-                break
-            step_in = torch.tensor([[nxt]], dtype=torch.long, device=self.device)
-            logits = self.model.step(step_in, cache, pos)[0, -1].float()
-            pos += 1
+            logits = feed([nxt])
 
         elapsed = time.time() - t0
         if streamer:
