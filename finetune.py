@@ -33,6 +33,7 @@ model does not have the capacity for real question answering, so treat this as
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import time
@@ -59,10 +60,24 @@ MIXES = {
             "HuggingFaceTB/smoltalk:smol-magpie-ultra:6,"
             "HuggingFaceTB/smoltalk:smol-summarize:1,"
             "HuggingFaceTB/smoltalk:smol-constraints:1",
+    # chat plus step-by-step math and who the model is. MetaMathQA is grade
+    # school word problems worked through; NuminaMath is harder problems with
+    # full solutions. Together they are about 30% of the mix, which teaches
+    # showing the work without crowding out conversation. The identity file
+    # comes from sftdata/make_identity.py, and a local file's number is how many
+    # times to repeat it rather than a share of the budget: 573 conversations
+    # would be 0.2% of the mix once, which is too faint to stick.
+    "chat-math": "HuggingFaceTB/smoltalk:everyday-conversations:2,"
+                 "HuggingFaceTB/smoltalk:smol-magpie-ultra:6,"
+                 "HuggingFaceTB/smoltalk:smol-summarize:1,"
+                 "HuggingFaceTB/smoltalk:smol-constraints:1,"
+                 "HuggingFaceTB/smoltalk:metamathqa-50k:1.5,"
+                 "HuggingFaceTB/smoltalk:numina-cot-100k:1.5,"
+                 "sftdata/identity.jsonl:3",
     "alpaca": "yahma/alpaca-cleaned",
     "dolly": "databricks/databricks-dolly-15k",
 }
-DEFAULT_MIX = "chat"
+DEFAULT_MIX = "chat-math"
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,9 +87,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--from-checkpoint", default="", help="default: newest one found")
     p.add_argument("--dataset", default=DEFAULT_MIX,
                    help="comma separated name[:config][:weight], see MIXES for shorthands")
-    p.add_argument("--max-examples", type=int, default=250_000,
+    p.add_argument("--max-examples", type=int, default=350_000,
                    help="cap on the assembled mix, 0 means no cap")
-    p.add_argument("--max-len", type=int, default=512)
+    # The model's whole context. At 512, 60% of the old mix was conversations
+    # whose first answer alone ran past the window, so they were cut mid
+    # sentence and taught the model answers that never end.
+    p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--batch-size", type=int, default=0,
                    help="sequences per micro batch per device, 0 sizes it to the model")
     p.add_argument("--grad-accum", type=int, default=0,
@@ -100,7 +118,11 @@ def size_batch(args, params: int, verbose: bool = True) -> None:
     optimizer step stay at 32 either way, so the tuning itself is unchanged.
     """
     if not args.batch_size:
-        args.batch_size = 16 if params < 250e6 else 8 if params < 600e6 else 4
+        base = 16 if params < 250e6 else 8 if params < 600e6 else 4
+        # Those sizes are for 512 tokens. XLA has no flash attention, so the
+        # attention scores are materialised and grow with the square of the
+        # length: double the length, a quarter of the batch.
+        args.batch_size = max(1, int(base * (512 / args.max_len) ** 2))
     if not args.grad_accum:
         args.grad_accum = max(1, 32 // args.batch_size)
     if verbose:
@@ -190,11 +212,15 @@ def row_to_turns(row: dict) -> list[tuple[str, str]]:
     return [("user", prompt), ("assistant", answer)]
 
 
+def _local(name: str) -> bool:
+    return name.endswith((".jsonl", ".json"))
+
+
 def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
     from datasets import load_dataset
 
     specs = parse_specs(args.dataset)
-    total_weight = sum(w for _, _, w in specs) or 1.0
+    total_weight = sum(w for n, _, w in specs if not _local(n)) or 1.0
     budget = args.max_examples or 0
     rng = np.random.default_rng(args.seed)
 
@@ -206,6 +232,14 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
         share = int(budget * weight / total_weight) if budget else 0
         label = f"{name}" + (f":{config}" if config else "")
         print(f"loading {label}")
+        if _local(name):
+            path = Path(name) if Path(name).is_absolute() else Path(__file__).parent / name
+            with path.open(encoding="utf-8") as f:
+                once = [t for t in (row_to_turns(json.loads(l)) for l in f if l.strip()) if t]
+            take = once * max(1, int(weight))
+            print(f"  {len(once):,} conversations x{max(1, int(weight))}")
+            convos += take
+            continue
         rows = load_dataset(name, config, split="train") if config \
             else load_dataset(name, split="train")
         if share and len(rows) > share:
@@ -252,6 +286,10 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
         seq: list[int] = []
         # True where the token is part of an answer, and so is worth a gradient.
         supervised: list[bool] = []
+        # Where the last complete answer ends. A conversation is cut there and
+        # nowhere else: a cut inside an answer trains on a reply with no end,
+        # which teaches the model to keep going.
+        whole = 0
         for role, body in zip(roles, ids):
             if role == "user":
                 seq += [USER_TOKEN] + body + [ASSISTANT_TOKEN]
@@ -261,9 +299,13 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
                 # the model to stop.
                 seq += body + [enc.eot_token]
                 supervised += [True] * (len(body) + 1)
+                if len(seq) <= L:
+                    whole = len(seq)
             if len(seq) > L:
                 break
-        seq, supervised = seq[:L], supervised[:L]
+        if not whole:
+            continue  # not even the first answer fits
+        seq, supervised = seq[:whole], supervised[:whole]
         n = len(seq) - 1
         if n < 8 or not any(supervised[1:]):  # nothing left to learn from
             continue

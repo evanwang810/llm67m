@@ -350,7 +350,7 @@ if [ -n "${SFT_HOURS:-}" ]; then
   if [ "$DEVICE" = "tpu" ]; then SFT_SCRIPT=finetune_tpu.py; fi
   # SFT_DATA takes any --dataset value: a MIXES shorthand ("chat", "smol",
   # "alpaca") or an explicit name[:config][:weight] list.
-  echo "=== instruction tuning for ${SFT_HOURS}h on ${SFT_DATA:-chat} (${SFT_SCRIPT}) ==="
+  echo "=== instruction tuning for ${SFT_HOURS}h on ${SFT_DATA:-chat-math} (${SFT_SCRIPT}) ==="
   exec python "$SFT_SCRIPT" --run-dir "$RUN" --hours "$SFT_HOURS" \
-    --dataset "${SFT_DATA:-chat}" ${SFT_EXTRA:-}
+    --dataset "${SFT_DATA:-chat-math}" ${SFT_EXTRA:-}
 fi
