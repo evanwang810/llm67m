@@ -78,6 +78,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", default="",
                    help="previous session's kernel, user/slug, mounted for its checkpoint")
     p.add_argument("--mode", choices=("train", "tokenize", "sft"), default="train")
+    p.add_argument("--corpus", default="sample-10BT",
+                   help="FineWeb-Edu config to tokenize; a CC-MAIN-* crawl is text the "
+                        "sample-* subsets have almost no overlap with")
     p.add_argument("--mount", action="append", default=[],
                    help="extra kernel to mount, user/slug, repeatable")
     p.add_argument("--no-decay", action="store_true",
@@ -98,12 +101,13 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         # every training session mounts it instead of redoing the work. On the
         # training side this needs no wiring: kaggle_run.sh already globs
         # /kaggle/input for a meta.json.
-        slug = args.slug or f"llm67m-tokens-{args.tokens}"
+        tag = "" if args.corpus == "sample-10BT" else "-" + args.corpus.lower()
+        slug = args.slug or f"llm67m-tokens-{args.tokens}{tag}"
         # kaggle_run.sh normally does the pip install, and this path skips it.
         cmd = ["bash", "-c",
                "pip install -q -U tiktoken datasets && "
                "python tokenize_fineweb.py --out-dir /kaggle/working/tokens "
-               f"--max-tokens {args.tokens}"]
+               f"--name {args.corpus} --max-tokens {args.tokens}"]
         env = {}
         device = "none"
     elif args.mode == "sft":

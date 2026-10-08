@@ -73,6 +73,9 @@ def parse_args() -> argparse.Namespace:
                    help="day Kaggle resets the quota, Monday=0; Kaggle uses Saturday")
     p.add_argument("--decay-fraction", type=float, default=0.75,
                    help="share of the final session spent decaying the LR")
+    p.add_argument("--tokens-from", default="",
+                   help="kernel holding the corpus to mount, instead of the one this "
+                        "campaign would tokenize itself")
     p.add_argument("--no-tokenize", action="store_true",
                    help="skip the tokenize kernel, the corpus already exists")
     p.add_argument("--dry-run", action="store_true")
@@ -232,7 +235,7 @@ def main() -> None:
     # The corpus is tokenized once, in its own CPU kernel, and every training
     # session mounts it. Doing it inside session one instead would redo the work
     # each session, or carry 15GB of shards through the output of every one.
-    tokens_id = f"{args.user}/{tokens_slug(args)}"
+    tokens_id = args.tokens_from or f"{args.user}/{tokens_slug(args)}"
     if not args.no_tokenize:
         if tokens_id not in have:
             print(f"pushing the tokenize kernel {tokens_id}", flush=True)
