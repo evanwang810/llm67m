@@ -93,6 +93,8 @@ MIXES = {
                  "HuggingFaceTB/smoltalk:numina-cot-100k:1.5,"
                  "@msmarco:1.5,"
                  "@calc:0.5,"
+                 "@convert:0.25,"
+                 "@time:0.25,"
                  "sftdata/identity.jsonl:3",
     "alpaca": "yahma/alpaca-cleaned",
     "dolly": "databricks/databricks-dolly-15k",
@@ -107,6 +109,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--from-checkpoint", default="", help="default: newest one found")
     p.add_argument("--dataset", default=DEFAULT_MIX,
                    help="comma separated name[:config][:weight], see MIXES for shorthands")
+    p.add_argument("--idle-tools", type=float, default=0.3,
+                   help="fraction of non-tool conversations given a tool list they "
+                        "do not need, so a declared tool is not a reason to call one")
     p.add_argument("--max-examples", type=int, default=350_000,
                    help="cap on the assembled mix, 0 means no cap")
     # The model's whole context. At 512, 60% of the old mix was conversations
@@ -277,6 +282,20 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
 
     if not convos:
         raise SystemExit(f"no usable rows in {args.dataset}; check the column names")
+
+    # Tools declared and correctly left alone. Without these the model learns
+    # that a tool list is a reason to call something, and starts searching the
+    # web to answer "write me a poem".
+    if args.idle_tools > 0:
+        # tools wants a random.Random; rng here is numpy's generator.
+        pyrng = random.Random(args.seed + 1)
+        idle = 0
+        for turns in convos:
+            roles = {r for r, _ in turns}
+            if "tools" not in roles and "call" not in roles and pyrng.random() < args.idle_tools:
+                turns.insert(0, ("tools", tools.idle_declaration(pyrng)))
+                idle += 1
+        print(f"{idle:,} conversations given a tool list they do not need")
     rng.shuffle(convos)
 
     # A system prompt has no token of its own, so it rides on the first user
@@ -286,6 +305,7 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
     for turns in convos:
         sys_txt = " ".join(c for r, c in turns if r == "system")
         first_user = True
+        tool_block = next((c for r, c in turns if r == "tools"), "")
         for role, content in turns:
             if role == "system":
                 continue
@@ -322,6 +342,11 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
             if role == "user":
                 seq += [USER_TOKEN] + body + [ASSISTANT_TOKEN]
                 supervised += [False] * (len(body) + 2)
+            elif role == "tools":
+                # The declaration leads the sequence, before the first user
+                # turn, and is never predicted: it is the caller's text.
+                seq += body
+                supervised += [False] * len(body)
             elif role == "call":
                 # The model writes the call, markers included: closing it with
                 # TOOL_RESULT is what tells the runtime to go and run it.

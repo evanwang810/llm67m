@@ -21,6 +21,8 @@ Commands inside the session:
     /probs            toggle the per-token probability table
     /history 0        previous turns to carry, 0 for a single-turn tuned model
     /rep 1.1          repetition penalty, 1 turns it off
+    /tools            list the tools offered to the model
+    /tools off        offer none, /tools on to restore them
     /stats            what this session has generated so far
     /reset            clear the conversation
     /help  /quit
@@ -182,6 +184,10 @@ class Session:
         # Only a checkpoint tuned on tool conversations knows the call format;
         # for any other, a stray special token just ends the reply as before.
         self.tools = bool(ckpt.get("tools"))
+        # What this caller is offering. The model knows no tool by name: it
+        # reads the declaration in the prompt, so changing this registry
+        # changes what it can call, with no retraining.
+        self.registry = tools.example_registry() if self.tools else tools.Registry()
         self.call_token = ckpt.get("tool_call_token", tools.TOOL_CALL)
         self.result_token = ckpt.get("tool_result_token", tools.TOOL_RESULT)
         self.step = ckpt.get("step", 0)
@@ -222,6 +228,11 @@ class Session:
         keep = self.history[-2 * turns:] if turns > 0 else []
         if self.sft:
             ids: list[int] = []
+            if self.tools and len(self.registry):
+                # No separator: training puts the user token straight after the
+                # block, and a small model is sensitive to the prompt it was tuned
+                # on differing from the one it is given.
+                ids += self.enc.encode_ordinary(self.registry.declaration())
             for role, content in keep:
                 ids += [self.user_token if role == "user" else self.assistant_token]
                 ids += self.enc.encode_ordinary(content)
@@ -303,7 +314,8 @@ class Session:
             if first_token_s is None:
                 first_token_s = time.time() - t0
 
-            if self.tools and nxt == self.call_token and call_ids is None and calls < tools.MAX_CALLS:
+            if (self.tools and len(self.registry) and nxt == self.call_token
+                    and call_ids is None and calls < tools.MAX_CALLS):
                 call_ids = []
                 logits = feed([nxt])
                 continue
@@ -314,7 +326,7 @@ class Session:
                     continue
                 # The model closed its call: run it, show it, and hand the
                 # output back with a fresh assistant turn to answer from.
-                name, arg, output = tools.run(self.enc.decode(call_ids))
+                name, arg, output = self.registry.run(self.enc.decode(call_ids))
                 calls += 1
                 call_ids = None
                 if streamer and streamer.started:
@@ -532,6 +544,21 @@ def main() -> None:
             elif cmd == "/probs":
                 settings.probs = not settings.probs
                 print(ui.dim(f"  probs = {settings.probs}"))
+            elif cmd == "/tools":
+                if arg in ("off", "none", "0"):
+                    session.registry = tools.Registry()
+                    print(ui.dim("  offering no tools"))
+                elif arg in ("on", "default", "1"):
+                    session.registry = tools.example_registry()
+                    print(ui.dim(f"  offering {len(session.registry)} tools"))
+                elif not session.tools:
+                    print(ui.bad("  this checkpoint was not tuned for tool use"))
+                elif len(session.registry):
+                    print(ui.dim("  offered to the model, by the names it sees:"))
+                    for n, a, d in session.registry.specs():
+                        print(f"    {ui.accent(n)}({a}) {ui.dim('- ' + d)}")
+                else:
+                    print(ui.dim("  offering no tools. /tools on to restore them"))
             elif cmd == "/rep":
                 try:
                     settings.rep = max(1.0, float(arg))

@@ -23,7 +23,10 @@ echo "=== llm67m: ${HOURS}h budget, preset ${PRESET}, ${MAX_TOKENS} tokens ==="
 cd "$CODE"
 
 if [ "${SKIP_PIP:-0}" != "1" ]; then
-  pip install -q tiktoken datasets
+  # -U, not bare install: the TPU image ships a datasets too old for its own
+  # pyarrow, and pip leaves an already-satisfied package alone. That pairing
+  # fails at import with pa.PyExtensionType, which pyarrow removed.
+  pip install -q -U tiktoken datasets
   # Optional, for braille charts in the monitor. Not the PyPI package of the same
   # name. Failure here is fine, the monitor falls back to ASCII.
   if [ -n "${TERMPLOT_REPO:-}" ]; then

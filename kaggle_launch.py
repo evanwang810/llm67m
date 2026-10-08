@@ -101,7 +101,7 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         slug = args.slug or f"llm67m-tokens-{args.tokens}"
         # kaggle_run.sh normally does the pip install, and this path skips it.
         cmd = ["bash", "-c",
-               "pip install -q tiktoken datasets && "
+               "pip install -q -U tiktoken datasets && "
                "python tokenize_fineweb.py --out-dir /kaggle/working/tokens "
                f"--max-tokens {args.tokens}"]
         env = {}
@@ -113,7 +113,7 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         slug = args.slug or f"llm67m-{args.preset}-sft"
         script = "finetune_tpu.py" if args.device == "tpu" else "finetune.py"
         cmd = ["bash", "-c",
-               "pip install -q tiktoken datasets && "
+               "pip install -q -U tiktoken datasets && "
                f"python {script} --run-dir /kaggle/working/run "
                f"--hours {args.sft_hours or 0.5} --dataset {args.sft_data}"]
         env = {}
