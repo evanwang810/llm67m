@@ -73,9 +73,10 @@ def parse_args() -> argparse.Namespace:
                    help="day Kaggle resets the quota, Monday=0; Kaggle uses Saturday")
     p.add_argument("--decay-fraction", type=float, default=0.75,
                    help="share of the final session spent decaying the LR")
-    p.add_argument("--tokens-from", default="",
-                   help="kernel holding the corpus to mount, instead of the one this "
-                        "campaign would tokenize itself")
+    p.add_argument("--tokens-from", action="append", default=[],
+                   help="kernel holding a corpus to mount, instead of the one this "
+                        "campaign would tokenize itself; repeatable, and all of them "
+                        "are mounted so the trainer reads them as one corpus")
     p.add_argument("--no-tokenize", action="store_true",
                    help="skip the tokenize kernel, the corpus already exists")
     p.add_argument("--dry-run", action="store_true")
@@ -235,20 +236,26 @@ def main() -> None:
     # The corpus is tokenized once, in its own CPU kernel, and every training
     # session mounts it. Doing it inside session one instead would redo the work
     # each session, or carry 15GB of shards through the output of every one.
-    tokens_id = args.tokens_from or f"{args.user}/{tokens_slug(args)}"
+    corpora = args.tokens_from or [f"{args.user}/{tokens_slug(args)}"]
     if not args.no_tokenize:
-        if tokens_id not in have:
-            print(f"pushing the tokenize kernel {tokens_id}", flush=True)
-            cmd = launcher() + ["--user", args.user, "--mode", "tokenize",
-                                "--tokens", args.tokens]
-            raise SystemExit(run(cmd + (["--dry-run"] if args.dry_run else [])))
-        st = status_of(tokens_id)
-        print(f"tokens: {tokens_id} is {st}", flush=True)
-        if st in ("running", "queued"):
-            print("corpus still tokenizing, nothing to do this tick")
-            return
-        if st != "complete":
-            raise SystemExit(f"the tokenize kernel ended as {st}, campaign stuck")
+        # Every corpus has to be finished before a session mounts it: a session
+        # reading a corpus still being written would train on a fraction of it
+        # and record a step count that says otherwise.
+        for tokens_id in corpora:
+            if tokens_id not in have:
+                if args.tokens_from:
+                    raise SystemExit(f"corpus kernel {tokens_id} does not exist")
+                print(f"pushing the tokenize kernel {tokens_id}", flush=True)
+                cmd = launcher() + ["--user", args.user, "--mode", "tokenize",
+                                    "--tokens", args.tokens]
+                raise SystemExit(run(cmd + (["--dry-run"] if args.dry_run else [])))
+            st = status_of(tokens_id)
+            print(f"corpus: {tokens_id} is {st}", flush=True)
+            if st in ("running", "queued"):
+                print("corpus still tokenizing, nothing to do this tick")
+                return
+            if st != "complete":
+                raise SystemExit(f"corpus kernel {tokens_id} ended as {st}, campaign stuck")
 
     # Session 1 continues from the seed's checkpoint, so the seed has to have
     # finished. This is also what gates a campaign on a verification run: until
@@ -348,7 +355,7 @@ def main() -> None:
         # resumes from whichever mounted checkpoint has the highest step.
         mounts = [m for m in [previous, *attempts] if m]
         if not args.no_tokenize:
-            mounts.append(tokens_id)
+            mounts += corpora
         print(f"pushing session {session} as {slug}, mounting {mounts}", flush=True)
         raise SystemExit(push_session(args, session, slug, mounts))
 

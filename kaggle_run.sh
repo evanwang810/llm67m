@@ -39,7 +39,7 @@ fi
 # a finished token set anywhere under /kaggle/input and use the biggest one.
 find_tokens() {
   python - "$1" <<'PY'
-import json, sys
+import json, os, sys
 from pathlib import Path
 
 want = Path(sys.argv[1])
@@ -47,7 +47,7 @@ if (want / "meta.json").exists():
     print(want)
     raise SystemExit
 
-best = None
+found = {}
 patterns = ["meta.json", "*/meta.json", "*/*/meta.json", "*/*/*/meta.json",
             "*/*/*/*/meta.json", "*/*/*/*/*/meta.json"]
 for root in (Path("/kaggle/input"), Path("/kaggle/working")):
@@ -62,10 +62,14 @@ for root in (Path("/kaggle/input"), Path("/kaggle/working")):
             if "shards" not in m:
                 continue
             n = int(m.get("total_tokens", 0))
-            if n > 0 and (best is None or n > best[0]):
-                best = (n, meta.parent)
-if best:
-    print(best[1])
+            if n > 0:
+                found[meta.parent.resolve()] = n
+# Every corpus that is mounted, biggest first, joined for Corpus to read as one.
+# A single notebook output caps near 20GB, about 10B tokens, so a run wanting
+# more than that is given several datasets rather than one.
+if found:
+    order = sorted(found.items(), key=lambda kv: -kv[1])
+    print(os.pathsep.join(str(p) for p, _ in order))
 PY
 }
 

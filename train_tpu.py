@@ -154,6 +154,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     X.rendezvous("corpus-ready")
 
     train_corpus = Corpus(args.data_dir, args.block_size, "train")
+    say(f"corpus: {train_corpus.describe()}")
     try:
         val_corpus = Corpus(args.data_dir, args.block_size, "val")
     except (ValueError, KeyError):

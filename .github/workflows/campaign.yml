@@ -43,4 +43,8 @@ jobs:
             --preset medium \
             --seed-from "${{ vars.KAGGLE_USER }}/llm67m-medium-verify" \
             --preview-after 4 \
-            --preview-hours 0.5
+            --preview-hours 0.5 \
+            --tokens-from "${{ vars.KAGGLE_USER }}/llm67m-tokens-7-5e9" \
+            --tokens-from "${{ vars.KAGGLE_USER }}/llm67m-tokens-7-5e9-cc-main-2025-05" \
+            --tokens-from "${{ vars.KAGGLE_USER }}/llm67m-tokens-7-5e9-cc-main-2024-51" \
+            --tokens-from "${{ vars.KAGGLE_USER }}/llm67m-tokens-7-5e9-cc-main-2025-08"

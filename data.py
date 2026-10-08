@@ -12,6 +12,7 @@ show no loss discontinuity.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -48,20 +49,41 @@ def permute_index(i: int, n: int, seed: int) -> int:
 
 
 class Corpus:
-    """Memory-mapped view over one split of a tokenized dataset."""
+    """Memory-mapped view over one split of one or more tokenized datasets.
 
-    def __init__(self, data_dir: str | Path, block_size: int, split: str = "train") -> None:
-        self.data_dir = Path(data_dir)
-        meta_path = self.data_dir / "meta.json"
-        if not meta_path.exists():
-            raise FileNotFoundError(f"no meta.json in {self.data_dir}")
-        meta = json.loads(meta_path.read_text())
-        self.vocab_size: int = meta["vocab_size"]
-        self.tokenizer: str = meta["tokenizer"]
-        names = meta["shards"][split]
-        if not names:
-            raise ValueError(f"split '{split}' has no shards in {meta_path}")
-        self.shards = [np.memmap(self.data_dir / n, dtype=np.uint16, mode="r") for n in names]
+    More than one because a Kaggle notebook's output caps around 20GB, which is
+    roughly 10B tokens, and a run that wants more than that has to read several
+    datasets as one corpus. Shards are concatenated in the order the directories
+    are given, so block indices stay stable as long as that order does.
+    """
+
+    def __init__(self, data_dir: str | Path | list, block_size: int,
+                 split: str = "train") -> None:
+        dirs = ([Path(p) for p in data_dir] if isinstance(data_dir, (list, tuple))
+                else [Path(p) for p in str(data_dir).split(os.pathsep) if p])
+        self.data_dirs = dirs
+        self.data_dir = dirs[0]
+        self.shards, self.sources = [], []
+        self.vocab_size = self.tokenizer = None
+        for d in dirs:
+            meta_path = d / "meta.json"
+            if not meta_path.exists():
+                raise FileNotFoundError(f"no meta.json in {d}")
+            meta = json.loads(meta_path.read_text())
+            if self.vocab_size is None:
+                self.vocab_size, self.tokenizer = meta["vocab_size"], meta["tokenizer"]
+            elif (meta["vocab_size"], meta["tokenizer"]) != (self.vocab_size, self.tokenizer):
+                raise ValueError(
+                    f"{d} was tokenized as {meta['tokenizer']}/{meta['vocab_size']}, "
+                    f"the first corpus as {self.tokenizer}/{self.vocab_size}")
+            names = meta["shards"][split]
+            if not names and len(dirs) == 1:
+                raise ValueError(f"split '{split}' has no shards in {meta_path}")
+            for n in names:
+                self.shards.append(np.memmap(d / n, dtype=np.uint16, mode="r"))
+                self.sources.append(d.name)
+        if not self.shards:
+            raise ValueError(f"split '{split}' has no shards in any of {dirs}")
         self.block_size = block_size
 
         counts = [max(0, (len(s) - 1) // block_size) for s in self.shards]
@@ -79,6 +101,13 @@ class Corpus:
 
     def fingerprint(self) -> str:
         return f"{self.tokenizer}:{self.vocab_size}:{self.total_tokens}"
+
+    def describe(self) -> str:
+        if len(self.data_dirs) == 1:
+            return f"{self.total_tokens / 1e9:.2f}B tokens, {len(self.shards)} shards"
+        parts = ", ".join(f"{d.name}" for d in self.data_dirs)
+        return (f"{self.total_tokens / 1e9:.2f}B tokens, {len(self.shards)} shards "
+                f"across {len(self.data_dirs)} corpora: {parts}")
 
 
 class BatchSampler:

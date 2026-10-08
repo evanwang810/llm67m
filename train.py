@@ -490,6 +490,8 @@ def main() -> None:
         raise SystemExit("--data-dir is required (or use --smoke-test)")
 
     train_corpus = Corpus(args.data_dir, args.block_size, "train")
+    if master:
+        print(f"corpus: {train_corpus.describe()}", flush=True)
     try:
         val_corpus = Corpus(args.data_dir, args.block_size, "val")
     except (ValueError, KeyError):
