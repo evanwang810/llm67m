@@ -193,6 +193,12 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
         if args.reset_decay and decay_start is not None:
             # Every replica reads the same checkpoint, so they agree on this.
             decay_start, args.rewarm_from = None, step
+        elif decay_start is not None:
+            # A restart in the middle of a cooldown finishes the cooldown it was
+            # on. Same checkpoint on every replica, so the same length on each.
+            saved = ckpt.get("config", {}).get("train", {}).get("decay_steps")
+            if saved:
+                args.decay_steps = int(saved)
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")
         resume_optimizer = ckpt["optimizer"] if has_optim else None
@@ -268,6 +274,7 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
     # See train.py: the decay trigger wants the session pace, not the last
     # interval, or one checkpoint write reads as a slowdown and ends the run.
     pace_t0, pace_step0, pace_warm = time.time(), step, False
+    pace = None
     lr = quantized_lr(step, args, decay_start)
     val_loss: float | None = None
     stop_reason = ""
@@ -331,7 +338,16 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             if (args.auto_decay and decay_start is None and pace_warm
                     and step - pace_step0 >= 50):
                 pace = (time.time() - pace_t0) / (step - pace_step0)
-                if deadline - time.time() <= args.decay_steps * pace * 1.05:
+                # With --decay-fraction the cooldown is sized here, from the pace this
+                # session has actually run at, rather than from a step count fixed before
+                # it started. The preflight times clean steps at 1.30s; real training
+                # averages 1.76s with saves, evals and samples folded in, so a length taken
+                # from the preflight was 35% too long: the trigger fired at once and the
+                # final session would have decayed from its first minute and not finished.
+                if args.decay_fraction > 0:
+                    if deadline - time.time() <= args.decay_fraction * (deadline - session_start):
+                        local |= 1 << 1
+                elif deadline - time.time() <= args.decay_steps * pace * 1.05:
                     local |= 1 << 1
             flags = X.mesh_reduce("ctl", local, lambda vs: int(np.bitwise_or.reduce(vs)))
             force_save = bool(flags & 1) or bool(flags & 8)
@@ -342,6 +358,14 @@ def _mp_fn(index, args):  # noqa: ARG001  (xmp.spawn passes the process index)
             force_save = want_decay = want_stop = is_milestone = False
 
         if want_decay and decay_start is None:
+            if args.decay_fraction > 0:
+                # The length comes from the lead replica's measured pace and is shared,
+                # since every replica derives its learning rate from it and replicas
+                # on different schedules would step their weights apart.
+                fit = (int((deadline - time.time()) / pace * 0.95)
+                       if master and pace is not None else 0)
+                fit = X.mesh_reduce("decay-len", fit, max)
+                args.decay_steps = max(200, int(fit)) if fit else args.decay_steps
             decay_start = step
             say(f"[step {step}] entering decay phase over {args.decay_steps} steps")
         if decay_start is not None and step >= decay_start + args.decay_steps:

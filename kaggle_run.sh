@@ -221,19 +221,6 @@ else
   fi
 fi
 
-# DECAY_FRACTION stretches the decay over that fraction of this session. The
-# default length is sized for one session, which for a long multi session run
-# is a cooldown of well under 1% of training, where 10 to 20% is what matches
-# a full cosine. The step time comes from the preflight that just ran.
-if [ -n "${DECAY_FRACTION:-}" ] && [ -f "$RUN/preflight.json" ]; then
-  DECAY_STEPS="$(python - "$RUN/preflight.json" "$TRAIN_HOURS" "$DECAY_FRACTION" <<'PY'
-import json, sys
-spp = float(json.load(open(sys.argv[1]))["secs_per_step"])
-print(max(200, int(float(sys.argv[3]) * float(sys.argv[2]) * 3600 / spp)))
-PY
-)"
-fi
-
 echo "=== training ${TRAIN_HOURS}h on ${DEVICE}, decay ${DECAY_STEPS} steps, "\
 "milestone every ${MILESTONE_MIN} min ==="
 
@@ -247,6 +234,14 @@ DEADLINE_SECONDS="$(python -c "print(int($TRAIN_HOURS * 3600))")"
 DECAY_FLAGS=()
 if [ "${DECAY:-1}" != "0" ]; then DECAY_FLAGS+=(--auto-decay); fi
 if [ "${RESET_DECAY:-0}" = "1" ]; then DECAY_FLAGS+=(--reset-decay); fi
+# DECAY_FRACTION cools down over that share of the session. The trainer sizes
+# the step count itself from the pace it measures, which the preflight cannot:
+# it times clean steps, and real training runs about 35% slower once saves,
+# evals and samples are folded in. Appended after DECAY_FLAGS is created, or
+# the reset above would throw it away.
+if [ -n "${DECAY_FRACTION:-}" ]; then
+  DECAY_FLAGS+=(--decay-fraction "$DECAY_FRACTION")
+fi
 
 # How often to write a full checkpoint. On the TPU VM, /kaggle/working sits on
 # a disk that sustains about 10MB/s once the page cache is full, and a medium

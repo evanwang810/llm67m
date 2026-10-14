@@ -88,6 +88,9 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--reset-decay", action="store_true",
                    help="forget a decay phase stored in the resumed checkpoint and keep "
                         "training at full LR, for extending a run that ended too early")
+    g.add_argument("--decay-fraction", type=float, default=0.0,
+                   help="with --auto-decay, cool down over this share of the session, "
+                        "sized from the measured pace; overrides --decay-steps")
     g.add_argument("--auto-decay", action="store_true",
                    help="start decaying automatically so it finishes right before the deadline")
     g.add_argument("--max-steps", type=int, default=0, help="0 means run until the deadline")
@@ -547,6 +550,12 @@ def main() -> None:
         decay_start = ckpt.get("decay_start")
         if args.reset_decay and decay_start is not None:
             decay_start, args.rewarm_from = None, step
+        elif decay_start is not None:
+            # A restart in the middle of a cooldown has to finish the cooldown it
+            # was on, not one of whatever length the command line now says.
+            saved = ckpt.get("config", {}).get("train", {}).get("decay_steps")
+            if saved:
+                args.decay_steps = int(saved)
         best_val = ckpt.get("best_val")
         resumed_ema = ckpt.get("loss_ema")  # keeps the smoothed curve continuous across restarts
         if has_optim:
@@ -606,6 +615,7 @@ def main() -> None:
     # checkpoint that was enough to start the decay with most of a session
     # still left. Amortised over the session, saves cost what they really cost.
     pace_t0, pace_step0, pace_warm = time.time(), step, False
+    pace = None
     lr = lr_at(step, args, decay_start)  # so the final status is valid even if we break at once
     val_loss: float | None = None
     stop_reason = ""
@@ -658,13 +668,32 @@ def main() -> None:
         if (args.auto_decay and decay_start is None and pace_warm
                 and step - pace_step0 >= 50):
             pace = (time.time() - pace_t0) / (step - pace_step0)
-            if deadline - time.time() <= args.decay_steps * pace * 1.05:
+            # With --decay-fraction the cooldown is sized here, from the pace this
+            # session has actually run at, rather than from a step count fixed before
+            # it started. The preflight times clean steps at 1.30s; real training
+            # averages 1.76s with saves, evals and samples folded in, so a length taken
+            # from the preflight was 35% too long: the trigger fired at once and the
+            # final session would have decayed from its first minute and not finished.
+            if args.decay_fraction > 0:
+                window = deadline - session_start
+                if deadline - time.time() <= args.decay_fraction * window:
+                    flags[1] = 1
+            elif deadline - time.time() <= args.decay_steps * pace * 1.05:
                 flags[1] = 1
         if ddp:
             dist.all_reduce(flags, op=dist.ReduceOp.MAX)
         force_save, want_decay, want_stop = (bool(flags[i].item()) for i in range(3))
 
         if want_decay and decay_start is None:
+            if args.decay_fraction > 0 and pace is not None:
+                # The length comes from the lead replica's measured pace and is shared,
+                # since every replica derives its learning rate from it and replicas
+                # on different schedules would step their weights apart.
+                fit = torch.tensor([int((deadline - time.time()) / pace * 0.95)],
+                                   device=device)
+                if ddp:
+                    dist.broadcast(fit, src=0)
+                args.decay_steps = max(200, int(fit.item()))
             decay_start = step
             if master:
                 print(f"[step {step}] entering decay phase over {args.decay_steps} steps", flush=True)
