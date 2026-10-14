@@ -139,7 +139,6 @@ def _mp_fn(index, args):  # noqa: ARG001
 
     stopped_at = total_steps
     hard_cap = total_steps
-    started = time.time()
     for step in range(hard_cap):
         if step == 10:
             t10 = time.time()

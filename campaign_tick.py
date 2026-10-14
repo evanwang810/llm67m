@@ -173,7 +173,16 @@ def hours_used(kernel_id: str, status: str, budget: float) -> float:
     if status in ("running", "queued"):
         return budget
     times = [e.get("time", 0) for e in log_entries(kernel_id)]
-    return max(times) / 3600 if times else budget
+    if times:
+        return max(times) / 3600
+    if status in ("error", "cancel"):
+        # Kaggle returns an empty log for a kernel that died at startup, and
+        # charging those a full session made one 7-second crash read as the
+        # week's quota spent. A failure late enough to cost real hours leaves a
+        # long, readable log, so an empty one is counted as next to nothing.
+        print(f"  {kernel_id}: failed with an empty log, counting it as 0.25h")
+        return 0.25
+    return budget
 
 
 def tail_log(kernel_id: str, lines: int = 25) -> str:

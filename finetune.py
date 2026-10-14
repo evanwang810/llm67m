@@ -305,7 +305,6 @@ def build_dataset(args, enc) -> tuple[np.ndarray, np.ndarray]:
     for turns in convos:
         sys_txt = " ".join(c for r, c in turns if r == "system")
         first_user = True
-        tool_block = next((c for r, c in turns if r == "tools"), "")
         for role, content in turns:
             if role == "system":
                 continue
@@ -451,7 +450,6 @@ def main() -> None:
                 torch.from_numpy(ys[idx]).long().to(device))
 
     print("finetuning\n")
-    started = time.time()
     for step in range(hard_cap):
         if step == 10:
             t10 = time.time()
