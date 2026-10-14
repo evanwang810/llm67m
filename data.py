@@ -105,7 +105,10 @@ class Corpus:
     def describe(self) -> str:
         if len(self.data_dirs) == 1:
             return f"{self.total_tokens / 1e9:.2f}B tokens, {len(self.shards)} shards"
-        parts = ", ".join(f"{d.name}" for d in self.data_dirs)
+        # The leaf is "tokens" for every Kaggle mount, so name it by the
+        # dataset it came from; this line is what says which corpora loaded.
+        parts = ", ".join(d.parent.name if d.name in ("tokens", "data") and d.parent.name
+                          else d.name for d in self.data_dirs)
         return (f"{self.total_tokens / 1e9:.2f}B tokens, {len(self.shards)} shards "
                 f"across {len(self.data_dirs)} corpora: {parts}")
 

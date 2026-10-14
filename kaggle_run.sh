@@ -82,17 +82,25 @@ else
     echo "found existing tokens at $FOUND, using those instead of $TOKENS"
     TOKENS="$FOUND"
   fi
-  # Never try to write into the read-only input mount.
-  case "$TOKENS" in
-    /kaggle/input/*)
-      if [ ! -f "$TOKENS/meta.json" ]; then
-        echo "TOKENS_DIR=$TOKENS is under the read-only /kaggle/input and has no" >&2
-        echo "meta.json. Check the real path in the file browser, or unset" >&2
-        echo "TOKENS_DIR to tokenize fresh into /kaggle/working." >&2
-        exit 1
-      fi
-      ;;
-  esac
+  # Never try to write into the read-only input mount. TOKENS can name several
+  # corpora joined by colons now, so each one is checked on its own: testing
+  # the joined string as a single path is how session 7 died three times.
+  OLD_IFS="$IFS"
+  IFS=':'
+  for one in $TOKENS; do
+    case "$one" in
+      /kaggle/input/*)
+        if [ ! -f "$one/meta.json" ]; then
+          IFS="$OLD_IFS"
+          echo "TOKENS_DIR entry $one is under the read-only /kaggle/input and has" >&2
+          echo "no meta.json. Check the real path in the file browser, or unset" >&2
+          echo "TOKENS_DIR to tokenize fresh into /kaggle/working." >&2
+          exit 1
+        fi
+        ;;
+    esac
+  done
+  IFS="$OLD_IFS"
 fi
 
 if [ "${SMOKE:-0}" = "1" ]; then
@@ -103,9 +111,11 @@ else
   # during interpreter shutdown, after the shards are already written, so ask
   # separately whether the data is actually complete rather than trusting the
   # exit code.
-  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS" \
+  # Writing targets a single directory even when reading spans several.
+  WRITE_TOKENS="${TOKENS%%:*}"
+  python tokenize_fineweb.py --out-dir "$WRITE_TOKENS" --max-tokens "$MAX_TOKENS" \
     || echo "tokenizer exited non-zero, checking the shards themselves"
-  python tokenize_fineweb.py --out-dir "$TOKENS" --max-tokens "$MAX_TOKENS" --verify-only
+  python tokenize_fineweb.py --out-dir "$WRITE_TOKENS" --max-tokens "$MAX_TOKENS" --verify-only
 fi
 
 # Reserve time for tokenizing, and derive the schedule knobs from the budget:
@@ -114,7 +124,7 @@ fi
 # checkpoints at roughly 2GB with optimizer state. Kaggle gives about 21GB of
 # working disk. Running out halfway through loses the session, so say so now.
 python - "$MAX_TOKENS" "$RUN" "$TOKENS" <<'PY' || true
-import json, shutil, sys
+import json, os, shutil, sys
 from pathlib import Path
 
 tokens_gb = float(sys.argv[1]) * 2 / 1e9
@@ -124,12 +134,15 @@ while not root.exists() and root.parent != root:
 free_gb = shutil.disk_usage(root).free / 1e9
 
 # This runs after tokenization, so if the corpus is already written its bytes
-# are gone from the free figure and must not be counted a second time.
-meta = Path(sys.argv[3]) / "meta.json"
+# are gone from the free figure and must not be counted a second time. The
+# third argument can name several corpora joined by colons; all of them count.
 on_disk = 0.0
-if meta.exists():
+for part in sys.argv[3].split(os.pathsep):
+    meta = Path(part) / "meta.json"
+    if not meta.exists():
+        continue
     try:
-        on_disk = int(json.loads(meta.read_text()).get("total_tokens", 0)) * 2 / 1e9
+        on_disk += int(json.loads(meta.read_text()).get("total_tokens", 0)) * 2 / 1e9
     except Exception:
         pass
 
