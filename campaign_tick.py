@@ -185,6 +185,28 @@ def hours_used(kernel_id: str, status: str, budget: float) -> float:
     return budget
 
 
+def never_ran(kernel_id: str) -> bool:
+    """True for a kernel Kaggle dropped before running any of our code.
+
+    Both an empty log and no output files. The kernel script's first act is
+    cloning the repo into /kaggle/working, so one that ran for even a second
+    has output files, and one that crashed hours in has a long log; neither
+    can be mistaken for this. Telling the two apart matters because a queued
+    kernel that Kaggle drops is not a bug, and must not spend one of the
+    retries that exist to stop a real bug burning quota.
+    """
+    if log_entries(kernel_id):
+        return False
+    rc, out = kaggle("kernels", "files", kernel_id, "--format", "json")
+    if rc != 0 or "[" not in out:
+        return False  # cannot tell, so assume it ran: the cautious answer
+    try:
+        files = json.loads(out[out.index("["):])
+    except json.JSONDecodeError:
+        return False
+    return not files
+
+
 def tail_log(kernel_id: str, lines: int = 25) -> str:
     text = "".join(e.get("data", "") for e in log_entries(kernel_id))
     return "\n".join(text.splitlines()[-lines:])
@@ -324,6 +346,16 @@ def main() -> None:
             return
         if state == "unknown":
             raise SystemExit(f"unrecognised status for {latest}, not guessing")
+        if state in ("error", "cancel") and never_ran(latest):
+            # Dropped from the queue without running: replace it under the same
+            # name rather than counting it as an attempt. It produced nothing,
+            # so there is no checkpoint in it to lose.
+            print(f"{latest} never ran (no log, no output); Kaggle dropped it. "
+                  f"Replacing it rather than counting a retry.", flush=True)
+            if not args.dry_run:
+                kaggle("kernels", "delete", latest, "-y")
+            attempts = attempts[:-1]
+            state = MISSING
         if state in ("error", "cancel"):
             print(f"--- last lines of {latest} ---\n{tail_log(latest)}\n---", flush=True)
             if len(attempts) > args.retries:
