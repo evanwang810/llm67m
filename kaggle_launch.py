@@ -37,7 +37,10 @@ REPO = "https://github.com/evanwang810/llm67m"
 
 # From the Kaggle CLI's own docs. Only the shapes this project can actually use.
 MACHINES = {
-    "tpu": "Tpu1VmV38",
+    # A v5e-8. Every "v3-8" session already ran on one: Kaggle moved v3-8
+    # sessions onto v5e-8s, and the medium model measured 482 TFLOP/s, past a
+    # v3-8's 420 peak. The old label then stopped scheduling at all.
+    "tpu": "TpuV5E8",
     "t4x2": "NvidiaTeslaT4",
     "p100": "NvidiaTeslaP100",
     "none": None,

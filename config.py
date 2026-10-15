@@ -47,7 +47,7 @@ PRESETS: dict[str, dict] = {
     "125m": {"n_layer": 12, "n_head": 12, "n_embd": 768},
     # 65.44M non-embedding, if you want to be strictly under 67M.
     "65m": {"n_layer": 11, "n_head": 11, "n_embd": 704},
-    # 134.51M non-embedding, 173.14M total. Sized for ONE 8.5 hour TPU v3-8
+    # 134.51M non-embedding, 173.14M total. Sized for ONE 8.5 hour Kaggle TPU
     # session: at roughly 126 effective TFLOP/s that budget is 3.9e18 FLOPs, and
     # the Chinchilla-optimal model there is about 179M total on 3.5B tokens.
     # GPT-2 small's width made deeper, so head_dim stays at 64.
@@ -55,7 +55,8 @@ PRESETS: dict[str, dict] = {
     # 302.0M non-embedding, 353.6M total. The GPT-2 medium shape, so the loss
     # curve is directly comparable to a published number instead of only to
     # itself. Chinchilla wants 7.1B tokens on it, which is 1.5e19 FLOPs, or
-    # three 8.5 hour TPU v3-8 sessions at the 163 TFLOP/s this actually runs at.
+    # three 8.5 hour Kaggle TPU sessions. (Kaggle's TPU is a v5e-8, not the v3-8
+    # these notes once assumed; measured, this model runs at 482 TFLOP/s.)
     # Adam state is 5.7GB of the 15.75GB per core, leaving room for activations.
     "medium": {"n_layer": 24, "n_head": 16, "n_embd": 1024},
 }

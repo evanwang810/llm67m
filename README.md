@@ -143,7 +143,7 @@ learnable at this size in a way open-domain QA is not.
 
 ## Why not the TPU
 
-Kaggle's TPU v3-8 is genuinely 5x to 15x a dual T4 on this workload, it has
+Kaggle's TPU (a v5e-8; it used to be listed as a v3-8) is genuinely 5x to 15x a dual T4 on this workload, it has
 native bf16 so the entire GradScaler problem disappears, and its ~20 hr/week
 quota is separate from your GPU quota, so it would add to your budget rather than
 replace it. The speedup is real.

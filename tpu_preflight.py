@@ -95,9 +95,9 @@ def gate_1_probe():
     log(f"  {facts.get('xla_api', '')}")
     if kind != "TPU":
         fail("gate 1 (import)", f"torch_xla came up on {kind!r}, not TPU",
-             "Set the accelerator to TPU VM v3-8 and restart the session.")
+             "Set the accelerator to TPU v5e-8 and restart the session.")
     if n and n < 8:
-        log(f"  WARNING: {n} devices, expected 8 on a v3-8. Continuing.")
+        log(f"  WARNING: {n} devices, expected 8 on a v5e-8. Continuing.")
     log(f"  gate 1 ok ({time.time() - t0:.1f}s)")
     return facts
 

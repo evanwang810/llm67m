@@ -183,7 +183,7 @@ fi
 if [ "$DEVICE" = "tpu" ]; then
   TRAIN_SCRIPT=train_tpu.py
   LAUNCH=(python)   # train_tpu.py spawns its own replicas, there is no torchrun
-  # A v3 core has 15.75GB of HBM and attention scores are batch x heads x seq x
+  # A v5e chip has 15.75GB of usable HBM and attention scores are batch x heads x seq x
   # seq in fp32, since XLA has no flash kernel and decomposes SDPA. At
   # micro_batch 8 that is 384MB per layer, and nineteen layers of it does not
   # fit. Four halves it, and grad_accum absorbs the difference so tokens per

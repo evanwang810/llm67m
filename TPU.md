@@ -1,6 +1,6 @@
 # Running on the TPU instead
 
-A Kaggle TPU VM v3-8 is roughly ten to fifteen times the effective throughput of
+A Kaggle TPU v5e-8 is roughly ten to fifteen times the effective throughput of
 the dual T4s, which turns the three-session plan for a 101M model into one
 afternoon. It is also the less proven path in this repo: the CUDA trainer has
 run for hours on real hardware, and the XLA one has been tested against a stubbed
@@ -8,8 +8,14 @@ run for hours on real hardware, and the XLA one has been tested against a stubbe
 
 ## The cell
 
-One cell, same as the GPU path, with the accelerator set to **TPU VM v3-8** in
+One cell, same as the GPU path, with the accelerator set to **TPU v5e-8** in
 the notebook sidebar.
+
+Every session here ran on a v5e-8, including the ones whose notes below say
+v3-8. Kaggle moved v3-8 sessions onto v5e-8s as the v3s were retired, and the
+numbers prove it: the medium model measured 482 TFLOP/s, past a v3-8's 420
+theoretical peak, and an ordinary 31% of a v5e-8's 1,576. A kernel that still
+requests the v3-8 label now sits in the queue and dies without running.
 
 ```python
 !rm -rf /kaggle/working/code && git clone -q https://github.com/evanwang810/llm67m /kaggle/working/code
@@ -47,7 +53,7 @@ A full shakedown on a real v3-8, all ten stages green:
 |---|---|
 | throughput | **202,000 tokens/sec** on the 173M model |
 | per step | 0.32s |
-| effective | 163 TFLOP/s, 39% of the chip's 420 peak |
+| effective | 246 TFLOP/s by the model's own count, 16% of a v5e-8's 1,576 peak (the 39% once written here was against a v3-8's 420, the wrong chip; the 354M medium model reaches 31%) |
 | against the dual T4 | **4.8x** |
 | compilations | 4 during warmup, then flat |
 

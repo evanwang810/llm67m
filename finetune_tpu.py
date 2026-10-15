@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Instruction tuning on a Kaggle TPU VM v3-8, writing the same sft_*.pt.
+"""Instruction tuning on a Kaggle TPU v5e-8, writing the same sft_*.pt.
 
     python finetune_tpu.py --run-dir /kaggle/working/run --hours 0.8
 

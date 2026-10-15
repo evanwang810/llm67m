@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Train the same GPT on a Kaggle TPU VM v3-8, in the same checkpoint format.
+"""Train the same GPT on a Kaggle TPU v5e-8, in the same checkpoint format.
 
     python train_tpu.py --preset 67m --data-dir /kaggle/working/tokens
 
