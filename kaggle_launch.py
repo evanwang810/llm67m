@@ -41,6 +41,10 @@ MACHINES = {
     # sessions onto v5e-8s, and the medium model measured 482 TFLOP/s, past a
     # v3-8's 420 peak. The old label then stopped scheduling at all.
     "tpu": "TpuV5E8",
+    # Trillium. Listed by the Kaggle CLI, but Kaggle notes some accelerators are
+    # competition or admin only, so whether a free account gets one is found out
+    # by asking. Same 8 devices as a v5e-8, so batch math and resume are unchanged.
+    "tpu-v6e": "TpuV6E8",
     "t4x2": "NvidiaTeslaT4",
     "p100": "NvidiaTeslaP100",
     "none": None,
@@ -118,7 +122,7 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
         # hold: no preflight, no pretraining. finetune picks the newest
         # non-SFT checkpoint under /kaggle/input by itself.
         slug = args.slug or f"llm67m-{args.preset}-sft"
-        script = "finetune_tpu.py" if args.device == "tpu" else "finetune.py"
+        script = "finetune_tpu.py" if args.device.startswith("tpu") else "finetune.py"
         cmd = ["bash", "-c",
                "pip install -q -U tiktoken datasets && "
                f"python {script} --run-dir /kaggle/working/run "
@@ -128,7 +132,9 @@ def build_payload(args, out: Path) -> tuple[Path, str]:
     else:
         slug = args.slug or f"llm67m-{args.preset}-s{args.session}"
         cmd = ["bash", "kaggle_run.sh", str(args.hours), args.preset, args.tokens]
-        env = {"DEVICE": args.device, "MONITOR": "1"}
+        # kaggle_run.sh knows "tpu", not which generation; that is the request.
+        env = {"DEVICE": "tpu" if args.device.startswith("tpu") else args.device,
+               "MONITOR": "1"}
         if args.no_decay:
             env["DECAY"] = "0"
         if args.reset_decay:

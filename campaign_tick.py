@@ -352,7 +352,7 @@ def main() -> None:
                     "--mount", previous]
                 raise SystemExit(run(cmd + (["--dry-run"] if args.dry_run else [])))
 
-        if args.device == "tpu" and window_used + args.hours > args.tpu_quota_hours:
+        if args.device.startswith("tpu") and window_used + args.hours > args.tpu_quota_hours:
             print(f"waiting on quota: {window_used:.1f}h of TPU used since the reset on "
                   f"{week_start:%a %b %d}, another {args.hours}h session would pass "
                   f"{args.tpu_quota_hours}h")
